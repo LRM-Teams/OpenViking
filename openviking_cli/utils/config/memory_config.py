@@ -1,12 +1,18 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-from typing import Any, Dict, Literal
+from typing import Any, Dict, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+SKILL_TRAJECTORY_MODE_LEGACY = "legacy"
+SKILL_TRAJECTORY_MODE_CAUSAL = "causal"
+SKILL_TRAJECTORY_MODES = frozenset(
+    (SKILL_TRAJECTORY_MODE_LEGACY, SKILL_TRAJECTORY_MODE_CAUSAL)
+)
 
 
 class SessionAutoCommitConfig(BaseModel):
@@ -87,6 +93,16 @@ class MemoryConfig(BaseModel):
             "default."
         ),
     )
+    skill_trajectory_mode: Literal["legacy", "causal"] = Field(
+        default=SKILL_TRAJECTORY_MODE_LEGACY,
+        description=(
+            "Versioned switch for skill-trajectory behavior (ADR-0004). "
+            "'legacy' keeps original OpenViking behavior. "
+            "'causal' gates the AO ledger, fork construction, proposal, replay, "
+            "guidance, and aggregator pipeline. This field is the global default; "
+            "workspace override and session-creation freeze are later slices."
+        ),
+    )
     link_enabled: bool = Field(
         default=False,
         description=(
@@ -128,6 +144,24 @@ class MemoryConfig(BaseModel):
             )
         return "v3"
 
+    @field_validator("skill_trajectory_mode", mode="before")
+    @classmethod
+    def validate_skill_trajectory_mode(cls, value: Any) -> str:
+        if value is None:
+            return SKILL_TRAJECTORY_MODE_LEGACY
+        if not isinstance(value, str):
+            raise ValueError(
+                "memory.skill_trajectory_mode must be "
+                f"{SKILL_TRAJECTORY_MODE_LEGACY!r} or {SKILL_TRAJECTORY_MODE_CAUSAL!r}"
+            )
+        normalized = value.strip()
+        if normalized not in SKILL_TRAJECTORY_MODES:
+            raise ValueError(
+                "memory.skill_trajectory_mode must be "
+                f"{SKILL_TRAJECTORY_MODE_LEGACY!r} or {SKILL_TRAJECTORY_MODE_CAUSAL!r}"
+            )
+        return normalized
+
     @classmethod
     def from_dict(cls, config: Dict[str, Any]) -> "MemoryConfig":
         """Create configuration from dictionary."""
@@ -136,3 +170,76 @@ class MemoryConfig(BaseModel):
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
         return self.model_dump()
+
+
+def _memory_config_from_source(config: Any) -> MemoryConfig:
+    """Normalize a config source to ``MemoryConfig``.
+
+    Accepts the shapes callers already pass around: ``None`` (process singleton),
+    ``MemoryConfig``, an object with a ``memory`` section (``OpenVikingConfig``),
+    or a mapping (memory section or full config dict).
+    """
+    if config is None:
+        from openviking_cli.utils.config.open_viking_config import get_openviking_config
+
+        return get_openviking_config().memory
+    if isinstance(config, MemoryConfig):
+        return config
+    memory = getattr(config, "memory", None)
+    if isinstance(memory, MemoryConfig):
+        return memory
+    if isinstance(config, dict):
+        payload = config
+        nested = config.get("memory")
+        if isinstance(nested, dict):
+            payload = nested
+        return MemoryConfig.from_dict(payload)
+    mode = getattr(config, "skill_trajectory_mode", None)
+    if mode is not None:
+        return MemoryConfig(skill_trajectory_mode=mode)
+    raise TypeError(
+        "config must be MemoryConfig, OpenVikingConfig, a mapping, or None"
+    )
+
+
+def resolve_skill_trajectory_mode(
+    config: Any = None,
+    *,
+    workspace_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """Return the effective skill trajectory mode (``legacy`` or ``causal``).
+
+    This slice resolves only the **global default** from
+    ``memory.skill_trajectory_mode``. ``workspace_id`` and ``session_id`` are
+    reserved for later slices (workspace override, then session-creation freeze)
+    and are ignored here.
+
+    ``config`` follows existing config-read habits: omit it to use
+    ``get_openviking_config()``, or pass ``MemoryConfig``, ``OpenVikingConfig``,
+    or a mapping (memory section or full config dict).
+    """
+    del workspace_id, session_id
+    return _memory_config_from_source(config).skill_trajectory_mode
+
+
+def is_causal_mode_enabled(
+    config: Any = None,
+    *,
+    workspace_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> bool:
+    """Return whether the resolved skill trajectory mode is ``causal``.
+
+    Scope and ``config`` sources match :func:`resolve_skill_trajectory_mode`.
+    Workspace override and session freeze are later slices; ``workspace_id``
+    and ``session_id`` are reserved and ignored here.
+    """
+    return (
+        resolve_skill_trajectory_mode(
+            config,
+            workspace_id=workspace_id,
+            session_id=session_id,
+        )
+        == SKILL_TRAJECTORY_MODE_CAUSAL
+    )
