@@ -67,13 +67,7 @@ EvidenceRole = Literal[
 CapturedState = Literal["committed", "live"]
 
 _AO_IDENTITY = ("anchor_kind", "ao_id", "source_session_id")
-_SESSION_STATE_REQUIRED = (
-    "anchor_kind",
-    "session_id",
-    "ledger_snapshot_watermark",
-    "live_ao_upper_bound",
-    "anchored_at",
-)
+_SESSION_STATE_IDENTITY = ("anchor_kind", "session_id")
 _INTERACTION_EDGE_REQUIRED = (
     "anchor_kind",
     "channel_id",
@@ -123,17 +117,19 @@ def _require_optional_str(value: Any, field: str) -> str | None:
 
 
 def canonical_anchor_key(anchor: dict[str, Any]) -> str:
-    """Stable serialization of an anchor (sorted keys; ao drops sequence).
+    """Stable serialization of an anchor identity (sorted keys).
 
     Identity is {workspace_id, canonical_anchor_key}. ``anchor_sequence`` is a
-    Q29 isolation bound, not part of the stable ao identity (Q25).
+    Q29 isolation bound, not part of the stable ao identity (Q25). session_state
+    identity is {anchor_kind, session_id}; snapshot watermarks belong to a
+    revision's frozen evidence view, not the subject.
     """
     validated = validate_anchor(anchor)
     kind = validated["anchor_kind"]
     if kind == ANCHOR_KIND_AO:
         identity = {key: validated[key] for key in _AO_IDENTITY}
     elif kind == ANCHOR_KIND_SESSION_STATE:
-        identity = {key: validated[key] for key in _SESSION_STATE_REQUIRED}
+        identity = {key: validated[key] for key in _SESSION_STATE_IDENTITY}
     else:
         identity = {key: validated[key] for key in _INTERACTION_EDGE_REQUIRED}
     return _canonical_dumps(identity)
@@ -518,6 +514,50 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
         raise
 
 
+def _revision_sort_key(revision: dict[str, Any]) -> tuple[str, str]:
+    return (str(revision.get("created_at") or ""), str(revision.get("revision_id") or ""))
+
+
+def _order_revisions(by_id: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Authoritative revision order: explicit supersedes chain, then siblings.
+
+    Walk each explicit ``supersedes_revision_id`` chain head-to-tail. Concurrent
+    sibling roots that do not form a chain are ordered by ``created_at`` then
+    ``revision_id``. Mutual supersede is never inferred from timestamps.
+    """
+    successors: dict[str, list[str]] = {rev_id: [] for rev_id in by_id}
+    has_predecessor_in_set: set[str] = set()
+    for rev_id, revision in by_id.items():
+        pred = revision.get("supersedes_revision_id")
+        if isinstance(pred, str) and pred in by_id:
+            successors[pred].append(rev_id)
+            has_predecessor_in_set.add(rev_id)
+    for children in successors.values():
+        children.sort(key=lambda child: _revision_sort_key(by_id[child]))
+
+    roots = [rev_id for rev_id in by_id if rev_id not in has_predecessor_in_set]
+    roots.sort(key=lambda rev_id: _revision_sort_key(by_id[rev_id]))
+
+    ordered: list[dict[str, Any]] = []
+    visited: set[str] = set()
+
+    def walk(rev_id: str) -> None:
+        if rev_id in visited:
+            return
+        visited.add(rev_id)
+        ordered.append(by_id[rev_id])
+        for child in successors[rev_id]:
+            walk(child)
+
+    for root in roots:
+        walk(root)
+
+    leftover = [rev_id for rev_id in by_id if rev_id not in visited]
+    leftover.sort(key=lambda rev_id: _revision_sort_key(by_id[rev_id]))
+    ordered.extend(by_id[rev_id] for rev_id in leftover)
+    return ordered
+
+
 class CausalExperiencesStore:
     """File-level causal-experiences store keyed at ``<root>/causal-experiences/``."""
 
@@ -715,14 +755,7 @@ class CausalExperiencesStore:
             by_id[str(revision["revision_id"])] = revision
         if not by_id:
             return None
-        ordered_ids = [
-            str(row["revision_id"])
-            for row in self._read_index_rows()
-            if row.get("fork_node_id") == fork_node_id and row.get("revision_id") in by_id
-        ]
-        leftover = [rev_id for rev_id in by_id if rev_id not in ordered_ids]
-        leftover.sort()
-        revisions = [by_id[rev_id] for rev_id in ordered_ids + leftover]
+        revisions = _order_revisions(by_id)
         return {
             "fork_node_id": fork_node_id,
             "latest_revision": revisions[-1],

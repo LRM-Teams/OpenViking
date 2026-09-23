@@ -39,14 +39,16 @@ def _ao_anchor(*, sequence: int = 10) -> dict:
     }
 
 
-def _session_state_anchor() -> dict:
-    return {
+def _session_state_anchor(**overrides: object) -> dict:
+    anchor: dict = {
         "anchor_kind": "session_state",
         "session_id": "sess-live",
         "ledger_snapshot_watermark": "wm-42",
         "live_ao_upper_bound": 7,
         "anchored_at": "2026-09-23T00:00:00.000Z",
     }
+    anchor.update(overrides)
+    return anchor
 
 
 def _interaction_edge_anchor() -> dict:
@@ -123,6 +125,14 @@ def test_validate_anchor_accepts_three_kinds_and_rejects_invalid() -> None:
     edge = validate_anchor(_interaction_edge_anchor())
     assert edge["from_segment_id"] == "seg-a"
     assert edge["interaction_event_id"] == "evt-9"
+    assert canonical_anchor_key(_ao_anchor(sequence=1)) == canonical_anchor_key(
+        _ao_anchor(sequence=99)
+    )
+    assert canonical_anchor_key(_interaction_edge_anchor()) == (
+        '{"anchor_kind":"interaction_edge","channel_id":"chan-1",'
+        '"dag_snapshot_watermark":"dag-wm-1","from_segment_id":"seg-a",'
+        '"interaction_event_id":"evt-9","to_segment_id":"seg-b"}'
+    )
 
     with pytest.raises(ValueError, match="anchor_kind"):
         validate_anchor({"anchor_kind": "memory", "ao_id": "x", "source_session_id": "s"})
@@ -289,6 +299,84 @@ def test_content_hash_roundtrip_and_tamper_detection() -> None:
     )
     with pytest.raises(ValueError, match="content_hash mismatch"):
         ForkNodeRevision.from_dict(tampered)
+
+
+def test_session_state_reuses_fork_node_across_watermarks(tmp_path: Path) -> None:
+    first_anchor = _session_state_anchor(
+        ledger_snapshot_watermark="wm-1",
+        live_ao_upper_bound=3,
+        anchored_at="2026-09-23T01:00:00.000Z",
+    )
+    second_anchor = _session_state_anchor(
+        ledger_snapshot_watermark="wm-2",
+        live_ao_upper_bound=9,
+        anchored_at="2026-09-23T02:00:00.000Z",
+    )
+    assert canonical_anchor_key(first_anchor) == canonical_anchor_key(second_anchor)
+    assert canonical_anchor_key(first_anchor) == (
+        '{"anchor_kind":"session_state","session_id":"sess-live"}'
+    )
+
+    store = _store(tmp_path)
+    first = store.upsert_fork_node(
+        _payload(anchor=first_anchor, revision_id="rev-ss-1"),
+        idempotency_key="ss-run-1",
+    )
+    second_payload = _payload(
+        revision_id="rev-ss-2",
+        diagnosis_run_id="diag-2",
+        created_at="2026-09-23T13:00:00.000Z",
+        anchor=second_anchor,
+        supersedes_revision_id=first["revision_id"],
+    )
+    second_payload.pop("fork_node_id", None)
+    second = store.upsert_fork_node(second_payload, idempotency_key="ss-run-2")
+    assert second["created"] is False
+    assert second["fork_node_id"] == first["fork_node_id"]
+    assert second["revision_id"] != first["revision_id"]
+
+    loaded = store.get_fork_node(first["fork_node_id"])
+    assert loaded is not None
+    assert len(loaded["revisions"]) == 2
+    assert [item["revision_id"] for item in loaded["revisions"]] == [
+        first["revision_id"],
+        second["revision_id"],
+    ]
+    assert loaded["revisions"][1]["supersedes_revision_id"] == first["revision_id"]
+    assert loaded["latest_revision"]["revision_id"] == second["revision_id"]
+    assert loaded["revisions"][0]["anchor"]["ledger_snapshot_watermark"] == "wm-1"
+    assert loaded["revisions"][1]["anchor"]["ledger_snapshot_watermark"] == "wm-2"
+
+
+def test_sibling_revisions_sort_by_created_at_without_inferred_supersede(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    later = store.upsert_fork_node(
+        _payload(
+            revision_id="rev-later",
+            created_at="2026-09-23T14:00:00.000Z",
+            diagnosis_run_id="diag-later",
+        ),
+        idempotency_key="sibling-later",
+    )
+    earlier_payload = _payload(
+        revision_id="rev-earlier",
+        created_at="2026-09-23T13:00:00.000Z",
+        diagnosis_run_id="diag-earlier",
+    )
+    earlier_payload.pop("fork_node_id", None)
+    earlier = store.upsert_fork_node(earlier_payload, idempotency_key="sibling-earlier")
+    assert earlier["fork_node_id"] == later["fork_node_id"]
+
+    loaded = store.get_fork_node(later["fork_node_id"])
+    assert loaded is not None
+    assert [item["revision_id"] for item in loaded["revisions"]] == [
+        "rev-earlier",
+        "rev-later",
+    ]
+    assert loaded["latest_revision"]["revision_id"] == "rev-later"
+    assert all(item["supersedes_revision_id"] is None for item in loaded["revisions"])
 
 
 def test_legacy_mode_upsert_denied(tmp_path: Path) -> None:
