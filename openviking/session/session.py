@@ -22,6 +22,10 @@ from openviking.message.part import ContextPart, TextPart, ToolPart
 from openviking.pyagfs.exceptions import AGFSClientError, AGFSHTTPError, AGFSNotFoundError
 from openviking.server.config import ToolOutputExternalizationConfig
 from openviking.server.identity import RequestContext, Role
+from openviking.session.ao_ledger_recorder import (
+    maybe_record_session_tool_exchanges,
+    maybe_write_session_archive_attribution,
+)
 from openviking.session.auto_commit_policy import AutoCommitPolicy
 from openviking.session.extraction_batch import (
     ExtractionBatchLimits,
@@ -1456,6 +1460,7 @@ class Session:
             await self._externalize_large_tool_output_group(group)
             messages.extend(group)
         await self._append_messages_authoritatively(messages)
+        maybe_record_session_tool_exchanges(self, messages)
         return messages
 
     def add_message(
@@ -2151,6 +2156,7 @@ class Session:
                 for result in archive_persist_results:
                     if isinstance(result, BaseException):
                         raise result
+                maybe_write_session_archive_attribution(self, archive_uri)
                 if retention_plan is not None:
                     await self._merge_archive_meta(
                         archive_uri,
