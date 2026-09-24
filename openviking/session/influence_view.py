@@ -36,6 +36,7 @@ ROLE_CONCLUSION = "conclusion"
 RELATION_INFLUENCE = "influence"
 RELATION_SKIP = "skip"
 DETERMINISTIC_FALLBACK_REASON = "deterministic_fallback"
+SYNTHETIC_ROOT_SINK_REASON = "synthetic_root_sink"
 OMITTED_GAP_REASON = "not_in_selected_ao_range"
 MAX_CRITIC_ROUNDS = 3
 INDEX_VERSION = 1
@@ -602,6 +603,26 @@ class Violation:
         )
 
 
+class HighSeverityViolation(ValueError):
+    """``freeze`` refused because ``validate_view`` still reports high-severity violations.
+
+    Callers should build a fallback view instead of publishing the draft.
+    """
+
+    def __init__(self, violations: Sequence[Violation]) -> None:
+        items = tuple(violations)
+        if not items:
+            raise ValueError("HighSeverityViolation requires at least one violation")
+        for item in items:
+            if not isinstance(item, Violation) or item.severity != "high":
+                raise ValueError("HighSeverityViolation requires high-severity Violation values")
+        self.violations = items
+        codes = ", ".join(item.code for item in items)
+        super().__init__(
+            f"freeze refused: {len(items)} high-severity violation(s): {codes}"
+        )
+
+
 @dataclass(frozen=True)
 class CriticPatchRecord:
     """Provenance for one refiner round that addressed a violation."""
@@ -789,10 +810,23 @@ class InfluenceViewDraft:
         construction_mode: ConstructionMode = CONSTRUCTION_MODE_ADAPTIVE,
         revision_id: str | None = None,
         frozen_at: str | None = None,
+        enforce_checks: bool = True,
     ) -> InfluenceViewRevision:
+        """Freeze this draft. High-severity violations refuse the freeze by default.
+
+        Set ``enforce_checks=False`` only when the caller has already decided
+        the draft may be stored. A raised ``HighSeverityViolation`` means the
+        caller should switch to ``build_minimal_fallback_view``.
+        """
         mode = _require_choice(construction_mode, "construction_mode", CONSTRUCTION_MODES)
         stamp = _utc_now_iso() if frozen_at is None else _require_str(frozen_at, "frozen_at")
         identity = revision_id or uuid.uuid4().hex
+        if not isinstance(enforce_checks, bool):
+            raise ValueError("enforce_checks must be a bool")
+        if enforce_checks:
+            high = [item for item in validate_view(self) if item.severity == "high"]
+            if high:
+                raise HighSeverityViolation(high)
         blocks = tuple(self.blocks)
         claims = tuple(self.claims)
         return InfluenceViewRevision(
@@ -1226,10 +1260,123 @@ def _contiguous_runs(records: Sequence[SourceRef]) -> list[list[SourceRef]]:
     return runs
 
 
-def build_minimal_fallback_view(session: Mapping[str, Any]) -> InfluenceViewRevision:
-    """One block per segment over the given AO interval, with no claims.
+def _synthetic_endpoint_block(
+    *,
+    block_id: str,
+    role: BlockRole,
+    sequence: int,
+    session_id: str,
+    summary: str,
+) -> InfluenceBlock:
+    participant_id = f"synthetic-{role}"
+    segment_id = f"synthetic-{role}"
+    ref = SourceRef(
+        ao_id=f"synthetic-{block_id}",
+        sequence=sequence,
+        participant_id=participant_id,
+        segment_id=segment_id,
+        session_id=session_id,
+        content_hash=f"synthetic-{block_id}",
+    )
+    return InfluenceBlock(
+        block_id=block_id,
+        role=role,
+        participant_id=participant_id,
+        segment_ref=SegmentRef(segment_id=segment_id, session_id=session_id),
+        ao_start_seq=sequence,
+        ao_end_seq=sequence,
+        summary=summary,
+        input="",
+        output="",
+        authorship=participant_id,
+        granularity_reason=SYNTHETIC_ROOT_SINK_REASON,
+        source_content_hashes=(ref.content_hash,),
+        source_refs=(ref,),
+    )
 
-    ``granularity_reason`` is always ``deterministic_fallback`` and
+
+def _fallback_evidence(ref: SourceRef, watermark: str) -> InfluenceEvidenceRef:
+    return InfluenceEvidenceRef(
+        ao_id=ref.ao_id,
+        source_session_id=ref.session_id,
+        source_archive_id=None,
+        archive_commit_watermark=None,
+        source_sequence=ref.sequence,
+        source_read_snapshot_watermark=watermark,
+        evidence_role="contemporaneous_basis",
+        evidence_content_hash=ref.content_hash,
+        captured_state="committed",
+    )
+
+
+def _fallback_link(
+    source: InfluenceBlock,
+    target: InfluenceBlock,
+    omitted: Sequence[OmittedRange],
+    watermark: str,
+) -> InfluenceClaim:
+    crosses = any(
+        _ranges_overlap_gap(item, source.ao_end_seq + 1, target.ao_start_seq - 1)
+        for item in omitted
+    )
+    if crosses:
+        source_evidence = (_fallback_evidence(source.source_refs[0], watermark),)
+        target_evidence = (_fallback_evidence(target.source_refs[0], watermark),)
+        relation = RELATION_SKIP
+    else:
+        source_evidence = ()
+        target_evidence = ()
+        relation = RELATION_INFLUENCE
+    return InfluenceClaim(
+        claim_id=f"fallback-link-{source.block_id}-{target.block_id}",
+        source_block_id=source.block_id,
+        target_block_id=target.block_id,
+        carried_artifact="fallback-span",
+        downstream_effect="observed outcome",
+        relation_type=relation,
+        source_evidence_refs=source_evidence,
+        target_evidence_refs=target_evidence,
+    )
+
+
+def _with_diagnosis_root_sink(
+    blocks: list[InfluenceBlock],
+    coverage: CoverageManifest,
+    session_id: str,
+) -> tuple[list[InfluenceBlock], tuple[InfluenceClaim, ...]]:
+    """Attach a virtual task root and observed-outcome sink so diagnosis fallback validates."""
+    root = _synthetic_endpoint_block(
+        block_id="synthetic-task-root",
+        role=ROLE_TASK,
+        sequence=min(block.ao_start_seq for block in blocks) - 1,
+        session_id=session_id,
+        summary="virtual task root",
+    )
+    sink = _synthetic_endpoint_block(
+        block_id="synthetic-outcome-sink",
+        role=ROLE_CONCLUSION,
+        sequence=max(block.ao_end_seq for block in blocks) + 1,
+        session_id=session_id,
+        summary="observed-outcome sink",
+    )
+    links = [
+        link
+        for block in blocks
+        for link in (
+            _fallback_link(root, block, coverage.omitted_ranges, coverage.snapshot_watermark),
+            _fallback_link(block, sink, coverage.omitted_ranges, coverage.snapshot_watermark),
+        )
+    ]
+    return [root, *blocks, sink], tuple(links)
+
+
+def build_minimal_fallback_view(session: Mapping[str, Any]) -> InfluenceViewRevision:
+    """One block per segment over the given AO interval.
+
+    Segment blocks use ``granularity_reason=deterministic_fallback``. A
+    ``failure_diagnosis`` view also gets a virtual task root and an
+    observed-outcome sink (``granularity_reason=synthetic_root_sink``) so the
+    same structural checks that gate ``freeze`` accept the fallback.
     ``construction_mode`` is ``fallback``.
     """
     payload = _require_mapping(dict(session), "session")
@@ -1310,6 +1457,9 @@ def build_minimal_fallback_view(session: Mapping[str, Any]) -> InfluenceViewRevi
         snapshot_watermark=_require_str(watermark, "snapshot_watermark"),
     )
     view_id = payload.get("view_id") or f"fallback-{session_id}-{purpose}"
+    claims: tuple[InfluenceClaim, ...] = ()
+    if purpose == PURPOSE_FAILURE_DIAGNOSIS:
+        blocks, claims = _with_diagnosis_root_sink(blocks, coverage, session_id)
     draft = InfluenceViewDraft(
         view_id=_require_str(view_id, "view_id"),
         purpose=purpose,  # type: ignore[arg-type]
@@ -1317,6 +1467,7 @@ def build_minimal_fallback_view(session: Mapping[str, Any]) -> InfluenceViewRevi
         task_run_id=task_run_id,
         coverage=coverage,
         blocks=tuple(blocks),
+        claims=claims,
     )
     frozen_at = payload.get("frozen_at")
     revision_id = payload.get("revision_id")

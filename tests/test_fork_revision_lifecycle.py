@@ -11,12 +11,19 @@ import pytest
 
 from openviking.session import causal_experiences as ce
 from openviking.session.causal_experiences import (
+    APPLICABILITY_CONCLUSION_APPLICABLE,
+    APPLICABILITY_CONCLUSION_NOT,
+    APPLICABILITY_DIMENSIONS,
+    COUNTER_EXAMPLE_CONCLUSION_CLEAR,
+    COUNTER_EXAMPLE_CONCLUSION_FOUND,
     FORK_CANDIDATE_ROLE,
     CausalExperiencesStore,
+    ControlContract,
     ForkStatus,
     InfluenceGrounding,
     InterventionIndexCorruptError,
     ServerChecks,
+    ValidationOutcome,
     influence_position_key,
 )
 from tests.test_causal_experiences import _ao_anchor, _payload, _seven_sections, _store
@@ -53,10 +60,41 @@ def _independent_control() -> dict[str, str]:
     return {"ref_kind": "independent_control", "ref_id": "ctl-1"}
 
 
-def _validated_evidence() -> dict[str, list[dict[str, str]]]:
+def _control_contract(**overrides: object) -> dict[str, object]:
+    contract: dict[str, object] = {
+        "anchor_state_snapshot": "snap-1",
+        "task_input": "fix the build",
+        "agent_model_prompt_policy": "model-a/policy-1",
+        "tool_dependency_versions": {"pytest": "8.0"},
+        "permissions": "workspace-read",
+        "budget": "tokens:1000",
+        "evaluator": "evaluator-independent",
+        "frozen_at": "2026-09-24T00:00:01.000Z",
+    }
+    contract.update(overrides)
+    return contract
+
+
+def _passing_gates() -> dict[str, object]:
+    return {
+        "anchor_valid": {"valid": True, "checked_at": "2026-09-24T00:00:00.000Z"},
+        "applicability_check": {
+            dimension: APPLICABILITY_CONCLUSION_APPLICABLE for dimension in APPLICABILITY_DIMENSIONS
+        },
+        "counter_example_check": {
+            "conclusion": COUNTER_EXAMPLE_CONCLUSION_CLEAR,
+            "refs": ["ref-counter-1"],
+        },
+        "no_high_severity_contradictions": True,
+        "control_contract": _control_contract(),
+    }
+
+
+def _validated_evidence() -> dict[str, object]:
     return {
         "observed_branch_refs": [_observed_branch()],
         "independent_control_refs": [_independent_control()],
+        **_passing_gates(),
     }
 
 
@@ -367,3 +405,117 @@ def test_upsert_rejects_direct_validated_and_invalidated_status(tmp_path) -> Non
     stored = store.get_revision(accepted["fork_node_id"], accepted["revision_id"])
     assert stored is not None
     assert stored["status"] == ForkStatus.PROVISIONAL
+
+
+def _commit(tmp_path) -> tuple[CausalExperiencesStore, str, str]:
+    store = _store(tmp_path)
+    provisional = store.commit_provisional(
+        store.submit_fork_draft(_payload()),
+        _PASSING_CHECKS,
+    )
+    return store, provisional.fork_node_id, provisional.revision_id
+
+
+@pytest.mark.parametrize(
+    ("dropped", "expected"),
+    [
+        ("anchor_valid", ("anchor_valid",)),
+        ("applicability_check", ("applicability_check",)),
+        ("counter_example_check", ("counter_example_check",)),
+        ("no_high_severity_contradictions", ("no_high_severity_contradictions",)),
+        ("control_contract", ("control_contract",)),
+    ],
+)
+def test_validation_gate_missing_one_requirement_stays_provisional(
+    tmp_path, dropped: str, expected: tuple[str, ...]
+) -> None:
+    store, fork_node_id, revision_id = _commit(tmp_path)
+    evidence = _validated_evidence()
+    del evidence[dropped]
+    result = store.append_validated(fork_node_id, evidence)
+    assert isinstance(result, ValidationOutcome)
+    assert result.status == ForkStatus.PROVISIONAL
+    assert result.missing_requirements == expected
+    assert result.revision_id == revision_id
+    loaded = store.get_fork_node(fork_node_id)
+    assert loaded is not None
+    assert [item["revision_id"] for item in loaded["revisions"]] == [revision_id]
+    assert loaded["latest_revision"]["status"] == ForkStatus.PROVISIONAL
+
+
+def test_validation_gates_all_pass_appends_validated(tmp_path) -> None:
+    store, fork_node_id, revision_id = _commit(tmp_path)
+    validated = store.append_validated(fork_node_id, _validated_evidence())
+    assert not isinstance(validated, ValidationOutcome)
+    assert validated.status == ForkStatus.VALIDATED
+    assert validated.supersedes_revision_id == revision_id
+    evidence = validated.validation_evidence
+    assert evidence is not None
+    assert evidence["anchor_valid"]["valid"] is True
+    assert evidence["no_high_severity_contradictions"] is True
+    assert evidence["control_contract"]["evaluator"] == "evaluator-independent"
+    assert evidence["control_contract"]["frozen_at"] == "2026-09-24T00:00:01.000Z"
+
+
+def test_failed_applicability_or_counter_example_stays_provisional(tmp_path) -> None:
+    store, fork_node_id, revision_id = _commit(tmp_path)
+    not_applicable = _validated_evidence()
+    not_applicable["applicability_check"] = {
+        dimension: APPLICABILITY_CONCLUSION_APPLICABLE for dimension in APPLICABILITY_DIMENSIONS
+    }
+    not_applicable["applicability_check"]["failure_mode"] = APPLICABILITY_CONCLUSION_NOT
+    result = store.append_validated(fork_node_id, not_applicable)
+    assert result.status == ForkStatus.PROVISIONAL
+    assert result.missing_requirements == ("applicability_check.failure_mode",)
+
+    contradicted = _validated_evidence()
+    contradicted["counter_example_check"] = {
+        "conclusion": COUNTER_EXAMPLE_CONCLUSION_FOUND,
+        "refs": ["ref-counter-9"],
+    }
+    result = store.append_validated(fork_node_id, contradicted)
+    assert result.status == ForkStatus.PROVISIONAL
+    assert result.missing_requirements == ("counter_example_check",)
+    loaded = store.get_fork_node(fork_node_id)
+    assert loaded is not None
+    assert loaded["latest_revision"]["revision_id"] == revision_id
+
+
+def test_control_contract_missing_evaluator_or_unfrozen_stays_provisional(tmp_path) -> None:
+    store, fork_node_id, revision_id = _commit(tmp_path)
+    missing_evaluator = _validated_evidence()
+    missing_evaluator["control_contract"] = _control_contract(evaluator="")
+    result = store.append_validated(fork_node_id, missing_evaluator)
+    assert result.status == ForkStatus.PROVISIONAL
+    assert result.missing_requirements == ("control_contract.evaluator",)
+
+    unfrozen = _validated_evidence()
+    contract = ControlContract(
+        anchor_state_snapshot="snap-1",
+        task_input="fix the build",
+        agent_model_prompt_policy="model-a/policy-1",
+        tool_dependency_versions={"pytest": "8.0"},
+        permissions="workspace-read",
+        budget="tokens:1000",
+        evaluator="evaluator-independent",
+        frozen_at="",
+    )
+    unfrozen["control_contract"] = contract
+    result = store.append_validated(fork_node_id, unfrozen)
+    assert isinstance(result, ValidationOutcome)
+    assert result.status == ForkStatus.PROVISIONAL
+    assert result.missing_requirements == ("control_contract.frozen_at",)
+    loaded = store.get_revision(fork_node_id, revision_id)
+    assert loaded is not None
+    assert loaded["status"] == ForkStatus.PROVISIONAL
+
+
+def test_illegal_validation_evidence_still_raises(tmp_path) -> None:
+    store, fork_node_id, revision_id = _commit(tmp_path)
+    evidence = _validated_evidence()
+    evidence["anchor_valid"] = "yes"
+    with pytest.raises(ValueError, match="anchor_valid"):
+        store.append_validated(fork_node_id, evidence)
+    loaded = store.get_fork_node(fork_node_id)
+    assert loaded is not None
+    assert loaded["latest_revision"]["revision_id"] == revision_id

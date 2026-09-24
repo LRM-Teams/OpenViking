@@ -23,7 +23,7 @@ import logging
 import os
 import threading
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,6 +82,53 @@ PositionKind = Literal["block", "edge", "cut"]
 
 INDEPENDENT_CONTROL_REF_KIND = "independent_control"
 OBSERVED_BRANCH_EVIDENCE_STATUS = "real"
+
+APPLICABILITY_DIMENSIONS = (
+    "task_decision_type",
+    "anchor_state",
+    "failure_mode",
+    "action_skill_role",
+)
+APPLICABILITY_CONCLUSION_APPLICABLE = "applicable"
+APPLICABILITY_CONCLUSION_PARTIALLY = "partially_applicable"
+APPLICABILITY_CONCLUSION_NOT = "not_applicable"
+APPLICABILITY_CONCLUSION_INSUFFICIENT = "insufficient"
+APPLICABILITY_CONCLUSIONS = frozenset(
+    (
+        APPLICABILITY_CONCLUSION_APPLICABLE,
+        APPLICABILITY_CONCLUSION_PARTIALLY,
+        APPLICABILITY_CONCLUSION_NOT,
+        APPLICABILITY_CONCLUSION_INSUFFICIENT,
+    )
+)
+APPLICABILITY_PASSING_CONCLUSIONS = frozenset(
+    (APPLICABILITY_CONCLUSION_APPLICABLE, APPLICABILITY_CONCLUSION_PARTIALLY)
+)
+COUNTER_EXAMPLE_CONCLUSION_CLEAR = "no_counter_example"
+COUNTER_EXAMPLE_CONCLUSION_FOUND = "counter_example_found"
+COUNTER_EXAMPLE_CONCLUSIONS = frozenset(
+    (COUNTER_EXAMPLE_CONCLUSION_CLEAR, COUNTER_EXAMPLE_CONCLUSION_FOUND)
+)
+
+_CONTROL_CONTRACT_FIELDS = (
+    "anchor_state_snapshot",
+    "task_input",
+    "agent_model_prompt_policy",
+    "tool_dependency_versions",
+    "permissions",
+    "budget",
+    "evaluator",
+    "frozen_at",
+)
+_CONTROL_CONTRACT_STRING_FIELDS = (
+    "anchor_state_snapshot",
+    "task_input",
+    "agent_model_prompt_policy",
+    "permissions",
+    "budget",
+    "evaluator",
+    "frozen_at",
+)
 
 
 class InterventionIndexCorruptError(RuntimeError):
@@ -781,6 +828,397 @@ def _normalize_validated_evidence(evidence: Any) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class AnchorValidity:
+    """Whether the provisional anchor and its refs were still valid, and when."""
+
+    valid: bool
+    checked_at: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.valid, bool):
+            raise ValueError("anchor_valid.valid must be a bool")
+        if not isinstance(self.checked_at, str):
+            raise ValueError("anchor_valid.checked_at must be a str")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"valid": self.valid, "checked_at": self.checked_at}
+
+
+@dataclass(frozen=True)
+class ApplicabilityCheck:
+    """One conclusion tier for each of the four applicability dimensions."""
+
+    task_decision_type: str
+    anchor_state: str
+    failure_mode: str
+    action_skill_role: str
+
+    def __post_init__(self) -> None:
+        for dimension in APPLICABILITY_DIMENSIONS:
+            value = getattr(self, dimension)
+            if not isinstance(value, str):
+                raise ValueError(f"applicability_check.{dimension} must be a str")
+            if value not in APPLICABILITY_CONCLUSIONS:
+                raise ValueError(
+                    f"applicability_check.{dimension} must be one of "
+                    f"{sorted(APPLICABILITY_CONCLUSIONS)}, got {value!r}"
+                )
+
+    def to_dict(self) -> dict[str, str]:
+        return {dimension: getattr(self, dimension) for dimension in APPLICABILITY_DIMENSIONS}
+
+
+@dataclass(frozen=True)
+class CounterExampleCheck:
+    """Counter-example conclusion plus the refs the check examined."""
+
+    conclusion: str
+    refs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.conclusion not in COUNTER_EXAMPLE_CONCLUSIONS:
+            raise ValueError(
+                "counter_example_check.conclusion must be one of "
+                f"{sorted(COUNTER_EXAMPLE_CONCLUSIONS)}, got {self.conclusion!r}"
+            )
+        object.__setattr__(self, "refs", tuple(self.refs))
+        for index, ref in enumerate(self.refs):
+            _require_str(ref, f"counter_example_check.refs[{index}]")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"conclusion": self.conclusion, "refs": list(self.refs)}
+
+
+@dataclass(frozen=True)
+class ControlContract:
+    """Frozen paired-control contract (Q85-A). Empty evaluator or frozen_at does not validate."""
+
+    anchor_state_snapshot: str
+    task_input: str
+    agent_model_prompt_policy: str
+    tool_dependency_versions: dict[str, str]
+    permissions: str
+    budget: str
+    evaluator: str
+    frozen_at: str
+
+    def __post_init__(self) -> None:
+        for field in _CONTROL_CONTRACT_STRING_FIELDS:
+            value = getattr(self, field)
+            if not isinstance(value, str):
+                raise ValueError(f"control_contract.{field} must be a str")
+        versions = self.tool_dependency_versions
+        if not isinstance(versions, dict):
+            raise ValueError("control_contract.tool_dependency_versions must be a dict")
+        normalized: dict[str, str] = {}
+        for key, value in versions.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError(
+                    "control_contract.tool_dependency_versions keys must be non-empty str"
+                )
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"control_contract.tool_dependency_versions[{key!r}] must be a str"
+                )
+            normalized[key] = value
+        object.__setattr__(self, "tool_dependency_versions", dict(sorted(normalized.items())))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "anchor_state_snapshot": self.anchor_state_snapshot,
+            "task_input": self.task_input,
+            "agent_model_prompt_policy": self.agent_model_prompt_policy,
+            "tool_dependency_versions": dict(self.tool_dependency_versions),
+            "permissions": self.permissions,
+            "budget": self.budget,
+            "evaluator": self.evaluator,
+            "frozen_at": self.frozen_at,
+        }
+
+
+@dataclass(frozen=True)
+class ValidationEvidence:
+    """Q81/Q85 evidence required before a fork revision may be validated."""
+
+    observed_branch_refs: tuple[dict[str, Any], ...]
+    independent_control_refs: tuple[dict[str, Any], ...]
+    anchor_valid: AnchorValidity
+    applicability_check: ApplicabilityCheck
+    counter_example_check: CounterExampleCheck
+    no_high_severity_contradictions: bool
+    control_contract: ControlContract
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "observed_branch_refs", tuple(self.observed_branch_refs))
+        object.__setattr__(
+            self, "independent_control_refs", tuple(self.independent_control_refs)
+        )
+        if not isinstance(self.anchor_valid, AnchorValidity):
+            raise ValueError("anchor_valid must be an AnchorValidity")
+        if not isinstance(self.applicability_check, ApplicabilityCheck):
+            raise ValueError("applicability_check must be an ApplicabilityCheck")
+        if not isinstance(self.counter_example_check, CounterExampleCheck):
+            raise ValueError("counter_example_check must be a CounterExampleCheck")
+        if not isinstance(self.no_high_severity_contradictions, bool):
+            raise ValueError("no_high_severity_contradictions must be a bool")
+        if not isinstance(self.control_contract, ControlContract):
+            raise ValueError("control_contract must be a ControlContract")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "observed_branch_refs": [dict(item) for item in self.observed_branch_refs],
+            "independent_control_refs": [dict(item) for item in self.independent_control_refs],
+            "anchor_valid": self.anchor_valid.to_dict(),
+            "applicability_check": self.applicability_check.to_dict(),
+            "counter_example_check": self.counter_example_check.to_dict(),
+            "no_high_severity_contradictions": self.no_high_severity_contradictions,
+            "control_contract": self.control_contract.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class ValidationOutcome:
+    """Returned when validation gates fail. The stored fork stays provisional."""
+
+    status: str
+    missing_requirements: tuple[str, ...]
+    fork_node_id: str
+    revision_id: str
+
+    def __post_init__(self) -> None:
+        if self.status != ForkStatus.PROVISIONAL:
+            raise ValueError("ValidationOutcome status must be provisional")
+        object.__setattr__(self, "missing_requirements", tuple(self.missing_requirements))
+        if not self.missing_requirements:
+            raise ValueError("ValidationOutcome requires missing_requirements")
+        object.__setattr__(self, "fork_node_id", _require_str(self.fork_node_id, "fork_node_id"))
+        object.__setattr__(self, "revision_id", _require_str(self.revision_id, "revision_id"))
+
+
+def _nonempty_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _reject_unexpected_keys(payload: dict[str, Any], allowed: Sequence[str], field: str) -> None:
+    extra = [key for key in payload if key not in allowed]
+    if extra:
+        raise ValueError(f"{field} unexpected keys: {sorted(extra)}")
+
+
+def _mapping_or_dict(value: Any, field: str) -> dict[str, Any]:
+    to_dict = getattr(value, "to_dict", None)
+    if to_dict is not None and not isinstance(value, dict):
+        value = to_dict()
+    return _require_mapping(value, field)
+
+
+def _assess_anchor_valid(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+    if "anchor_valid" not in payload or payload["anchor_valid"] is None:
+        return None, ["anchor_valid"]
+    raw = _mapping_or_dict(payload["anchor_valid"], "anchor_valid")
+    _reject_unexpected_keys(raw, ("valid", "checked_at"), "anchor_valid")
+    if "valid" not in raw:
+        checked = raw.get("checked_at")
+        if checked is not None and not isinstance(checked, str):
+            raise ValueError("anchor_valid.checked_at must be a str")
+        return None, ["anchor_valid"]
+    valid = raw["valid"]
+    if not isinstance(valid, bool):
+        raise ValueError("anchor_valid.valid must be a bool")
+    checked = raw.get("checked_at")
+    if checked is not None and not isinstance(checked, str):
+        raise ValueError("anchor_valid.checked_at must be a str")
+    missing: list[str] = []
+    if valid is not True:
+        missing.append("anchor_valid")
+    if not _nonempty_text(checked):
+        missing.append("anchor_valid.checked_at")
+    if missing:
+        return None, missing
+    return AnchorValidity(valid=True, checked_at=str(checked).strip()).to_dict(), []
+
+
+def _assess_applicability(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+    if "applicability_check" not in payload or payload["applicability_check"] is None:
+        return None, ["applicability_check"]
+    raw = _mapping_or_dict(payload["applicability_check"], "applicability_check")
+    _reject_unexpected_keys(raw, APPLICABILITY_DIMENSIONS, "applicability_check")
+    missing: list[str] = []
+    conclusions: dict[str, str] = {}
+    for dimension in APPLICABILITY_DIMENSIONS:
+        if dimension not in raw or raw[dimension] is None:
+            missing.append(f"applicability_check.{dimension}")
+            continue
+        value = raw[dimension]
+        if not isinstance(value, str):
+            raise ValueError(f"applicability_check.{dimension} must be a str")
+        if value not in APPLICABILITY_CONCLUSIONS:
+            raise ValueError(
+                f"applicability_check.{dimension} must be one of "
+                f"{sorted(APPLICABILITY_CONCLUSIONS)}, got {value!r}"
+            )
+        if value not in APPLICABILITY_PASSING_CONCLUSIONS:
+            missing.append(f"applicability_check.{dimension}")
+            continue
+        conclusions[dimension] = value
+    if missing:
+        return None, missing
+    return ApplicabilityCheck(**conclusions).to_dict(), []
+
+
+def _assess_counter_example(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+    if "counter_example_check" not in payload or payload["counter_example_check"] is None:
+        return None, ["counter_example_check"]
+    raw = _mapping_or_dict(payload["counter_example_check"], "counter_example_check")
+    _reject_unexpected_keys(raw, ("conclusion", "refs"), "counter_example_check")
+    missing: list[str] = []
+    conclusion = raw.get("conclusion")
+    if conclusion is None:
+        missing.append("counter_example_check")
+    elif not isinstance(conclusion, str):
+        raise ValueError("counter_example_check.conclusion must be a str")
+    elif conclusion not in COUNTER_EXAMPLE_CONCLUSIONS:
+        raise ValueError(
+            "counter_example_check.conclusion must be one of "
+            f"{sorted(COUNTER_EXAMPLE_CONCLUSIONS)}, got {conclusion!r}"
+        )
+    elif conclusion != COUNTER_EXAMPLE_CONCLUSION_CLEAR:
+        missing.append("counter_example_check")
+    refs = raw.get("refs")
+    normalized_refs: list[str] = []
+    if refs is None:
+        missing.append("counter_example_check.refs")
+    elif isinstance(refs, (str, bytes)) or not isinstance(refs, list):
+        raise ValueError("counter_example_check.refs must be a list")
+    else:
+        for index, item in enumerate(refs):
+            normalized_refs.append(_require_str(item, f"counter_example_check.refs[{index}]"))
+    if missing:
+        return None, missing
+    return (
+        CounterExampleCheck(conclusion=str(conclusion), refs=tuple(normalized_refs)).to_dict(),
+        [],
+    )
+
+
+def _assess_no_high_severity(payload: dict[str, Any]) -> tuple[bool | None, list[str]]:
+    if "no_high_severity_contradictions" not in payload:
+        return None, ["no_high_severity_contradictions"]
+    value = payload["no_high_severity_contradictions"]
+    if value is None:
+        return None, ["no_high_severity_contradictions"]
+    if not isinstance(value, bool):
+        raise ValueError("no_high_severity_contradictions must be a bool")
+    if value is not True:
+        return None, ["no_high_severity_contradictions"]
+    return True, []
+
+
+def _assess_control_contract(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+    if "control_contract" not in payload or payload["control_contract"] is None:
+        return None, ["control_contract"]
+    raw = _mapping_or_dict(payload["control_contract"], "control_contract")
+    _reject_unexpected_keys(raw, _CONTROL_CONTRACT_FIELDS, "control_contract")
+    missing: list[str] = []
+    strings: dict[str, str] = {}
+    for field in _CONTROL_CONTRACT_STRING_FIELDS:
+        if field not in raw or raw[field] is None:
+            missing.append(f"control_contract.{field}")
+            continue
+        value = raw[field]
+        if not isinstance(value, str):
+            raise ValueError(f"control_contract.{field} must be a str")
+        if not value.strip():
+            missing.append(f"control_contract.{field}")
+            continue
+        strings[field] = value.strip()
+    versions: dict[str, str] | None = None
+    if "tool_dependency_versions" not in raw or raw["tool_dependency_versions"] is None:
+        missing.append("control_contract.tool_dependency_versions")
+    else:
+        raw_versions = raw["tool_dependency_versions"]
+        if not isinstance(raw_versions, dict):
+            raise ValueError("control_contract.tool_dependency_versions must be a dict")
+        versions = {}
+        for key, value in raw_versions.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError(
+                    "control_contract.tool_dependency_versions keys must be non-empty str"
+                )
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"control_contract.tool_dependency_versions[{key!r}] must be a str"
+                )
+            versions[key.strip()] = value
+    if missing or versions is None:
+        return None, missing
+    contract = ControlContract(
+        anchor_state_snapshot=strings["anchor_state_snapshot"],
+        task_input=strings["task_input"],
+        agent_model_prompt_policy=strings["agent_model_prompt_policy"],
+        tool_dependency_versions=versions,
+        permissions=strings["permissions"],
+        budget=strings["budget"],
+        evaluator=strings["evaluator"],
+        frozen_at=strings["frozen_at"],
+    )
+    return contract.to_dict(), []
+
+
+def _assess_validation_gates(evidence: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Return normalized Q81/Q85 fields and any failed requirement ids.
+
+    Illegal shapes raise ``ValueError``. A missing or failed gate is a requirement
+    id, not an exception.
+    """
+    payload = _require_mapping(evidence, "evidence")
+    normalized: dict[str, Any] = {}
+    missing: list[str] = []
+    anchor, anchor_missing = _assess_anchor_valid(payload)
+    missing.extend(anchor_missing)
+    if anchor is not None:
+        normalized["anchor_valid"] = anchor
+    applicability, applicability_missing = _assess_applicability(payload)
+    missing.extend(applicability_missing)
+    if applicability is not None:
+        normalized["applicability_check"] = applicability
+    counter, counter_missing = _assess_counter_example(payload)
+    missing.extend(counter_missing)
+    if counter is not None:
+        normalized["counter_example_check"] = counter
+    contradictions, contradiction_missing = _assess_no_high_severity(payload)
+    missing.extend(contradiction_missing)
+    if contradictions is not None:
+        normalized["no_high_severity_contradictions"] = contradictions
+    contract, contract_missing = _assess_control_contract(payload)
+    missing.extend(contract_missing)
+    if contract is not None:
+        normalized["control_contract"] = contract
+    return normalized, missing
+
+
+def _validation_evidence_dict(
+    core: dict[str, Any], gates: dict[str, Any]
+) -> dict[str, Any]:
+    evidence = ValidationEvidence(
+        observed_branch_refs=tuple(core["observed_branch_refs"]),
+        independent_control_refs=tuple(core["independent_control_refs"]),
+        anchor_valid=AnchorValidity(
+            valid=gates["anchor_valid"]["valid"],
+            checked_at=gates["anchor_valid"]["checked_at"],
+        ),
+        applicability_check=ApplicabilityCheck(**gates["applicability_check"]),
+        counter_example_check=CounterExampleCheck(
+            conclusion=gates["counter_example_check"]["conclusion"],
+            refs=tuple(gates["counter_example_check"]["refs"]),
+        ),
+        no_high_severity_contradictions=gates["no_high_severity_contradictions"],
+        control_contract=ControlContract(**gates["control_contract"]),
+    )
+    return evidence.to_dict()
+
+
 def _normalize_counter_evidence(counter_evidence: Any) -> dict[str, Any]:
     payload = _require_mapping(counter_evidence, "counter_evidence")
     if not payload:
@@ -1223,12 +1661,37 @@ class CausalExperiencesStore:
             self._drafts.pop(draft.revision.revision_id, None)
         return revision
 
-    def append_validated(self, fork_node_id: str, evidence: dict[str, Any]) -> ForkRevision:
-        """Append a validated superseding revision. Does not overwrite history."""
+    def append_validated(
+        self, fork_node_id: str, evidence: dict[str, Any]
+    ) -> ForkRevision | ValidationOutcome:
+        """Append a validated revision only when every Q81/Q85 gate passes.
+
+        A real observed branch and an independent-control ref are still required
+        (``ValueError`` when they are absent or malformed). Anchor validity,
+        four-dimension applicability, the counter-example check, absence of
+        high-severity contradictions, and a frozen ``ControlContract`` are the
+        remaining gates: any miss leaves the stored fork provisional and returns
+        ``ValidationOutcome`` instead of writing a validated revision.
+        """
         self._require_causal_write()
-        normalized = _normalize_validated_evidence(evidence)
+        fork_node_id = _require_str(fork_node_id, "fork_node_id")
+        core = _normalize_validated_evidence(evidence)
+        gates, missing = _assess_validation_gates(evidence)
+        if missing:
+            loaded = self.get_fork_node(fork_node_id)
+            if loaded is None:
+                raise ValueError(f"unknown fork_node_id {fork_node_id!r}")
+            latest = loaded["latest_revision"]
+            return ValidationOutcome(
+                status=ForkStatus.PROVISIONAL,
+                missing_requirements=tuple(missing),
+                fork_node_id=fork_node_id,
+                revision_id=str(latest["revision_id"]),
+            )
         return self._append_status_revision(
-            fork_node_id, ForkStatus.VALIDATED, normalized
+            fork_node_id,
+            ForkStatus.VALIDATED,
+            _validation_evidence_dict(core, gates),
         )
 
     def append_invalidated(
@@ -1403,3 +1866,23 @@ def _public_intervention_row(row: dict[str, Any]) -> dict[str, Any]:
         "summary": row.get("summary"),
         "needs_revalidation": bool(row.get("needs_revalidation")),
     }
+
+
+def branch_retrieval_channel(branch: Mapping[str, Any], parent_status: str) -> str:
+    """Read-only retrieval channel for one branch. Does not write storage.
+
+    The parent revision channel is not inherited. Verified only when the branch
+    itself is real and the parent fork is validated (``evidence_status`` is
+    ``real`` and ``parent_status`` is ``validated``), or when an imagined branch
+    is itself validated (``imagined_synthetic`` under a validated parent).
+    ``imagined_unverified`` stays provisional even on a validated parent.
+    """
+    evidence = branch.get("evidence_status")
+    if evidence == "imagined_unverified":
+        return "provisional"
+    parent_validated = parent_status == ForkStatus.VALIDATED
+    if evidence == "real" and parent_validated:
+        return "verified"
+    if evidence == "imagined_synthetic" and parent_validated:
+        return "verified"
+    return "provisional"

@@ -13,6 +13,8 @@ from openviking.session.influence_view import (
     AORange,
     CoverageManifest,
     DETERMINISTIC_FALLBACK_REASON,
+    SYNTHETIC_ROOT_SINK_REASON,
+    HighSeverityViolation,
     InfluenceBlock,
     InfluenceClaim,
     InfluenceEvidenceRef,
@@ -332,7 +334,14 @@ def test_supersede_keeps_history_and_points_latest_at_the_new_revision(tmp_path:
         revision_id="rev-new",
         frozen_at="2026-09-24T03:00:00.000Z",
     )
-    other = _draft([_block("b1", [1])], purpose="failure_diagnosis").freeze(
+    root = _block("root", [1], role="task", participant_id="task", segment_id="seg-root")
+    mid = _block("b1", [2])
+    sink = _block("sink", [3], role="conclusion", participant_id="judge", segment_id="seg-sink")
+    other = _draft(
+        [root, mid, sink],
+        [_claim("c1", "root", "b1"), _claim("c2", "b1", "sink")],
+        purpose="failure_diagnosis",
+    ).freeze(
         revision_id="rev-diag",
         frozen_at="2026-09-24T04:00:00.000Z",
     )
@@ -439,3 +448,60 @@ def test_json_roundtrip_preserves_claim_status_and_critic_verdict() -> None:
     assert revision.claims[0].status == "supported"
     assert revision.claims[0].critic_verdict == "no_structural_issue"
     assert type(revision).from_dict(revision.to_dict()) == revision
+
+
+def test_freeze_rejects_high_severity_violations() -> None:
+    draft = _draft([_block("b1", [1])], purpose="failure_diagnosis")
+    with pytest.raises(HighSeverityViolation) as caught:
+        draft.freeze(revision_id="rev-bad", frozen_at="2026-09-24T06:00:00.000Z")
+    assert caught.value.violations
+    assert all(item.severity == "high" for item in caught.value.violations)
+    assert {item.code for item in caught.value.violations} >= {
+        "missing_task_root",
+        "missing_outcome_sink",
+    }
+    bypassed = draft.freeze(
+        revision_id="rev-bypass",
+        frozen_at="2026-09-24T06:00:00.000Z",
+        enforce_checks=False,
+    )
+    assert bypassed.revision_id == "rev-bypass"
+    assert validate_view(bypassed)
+
+
+def test_failure_diagnosis_fallback_freezes_with_synthetic_root_and_sink() -> None:
+    session = {
+        "session_id": SESSION,
+        "task_run_id": TASK,
+        "purpose": "failure_diagnosis",
+        "snapshot_watermark": "wm-fallback",
+        "view_id": "view-fb-diag",
+        "revision_id": "rev-fb-diag",
+        "frozen_at": "2026-09-24T07:00:00.000Z",
+        "ao_records": [
+            {
+                "ao_id": "ao-1",
+                "sequence": 1,
+                "participant_id": "agent-a",
+                "segment_id": "seg-a",
+                "content_hash": "hash-1",
+            },
+            {
+                "ao_id": "ao-3",
+                "sequence": 3,
+                "participant_id": "agent-b",
+                "segment_id": "seg-b",
+                "content_hash": "hash-3",
+            },
+        ],
+    }
+    revision = build_minimal_fallback_view(session)
+    assert revision.construction_mode == "fallback"
+    assert validate_view(revision) == []
+    synthetic = [
+        block for block in revision.blocks if block.granularity_reason == SYNTHETIC_ROOT_SINK_REASON
+    ]
+    assert [block.role for block in synthetic] == ["task", "conclusion"]
+    assert {block.role for block in revision.blocks} >= {"task", "agent_action", "conclusion"}
+    again = build_minimal_fallback_view(session)
+    assert again.content_hash == revision.content_hash
