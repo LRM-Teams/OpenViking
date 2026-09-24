@@ -8,6 +8,14 @@ not collapsed into one corpus. Verified/provisional slotting (8/4, with
 backfill) applies only to stateful cards. Segment/atom cards stay on the
 fact channel. Dependency-pattern hits expand inside one frozen view at read
 time and do not write a stored object.
+
+Online retrieval applies principal ACL inside each adapter before the quota
+is spent, then clamps the reranked list back to the causal-memory cap.
+Offline management reads are not part of this path and online code must not
+call them: ``materialize_strength(None)`` (strength with no principal),
+``CitationLedger.events()``, ``CausalBridgeStore.list_bridges``, and
+``ProjectionRegistry.to_dict``. Those dumps skip principal filtering.
+Online projection lookup goes through ``ProjectionRegistry.search``.
 """
 
 from __future__ import annotations
@@ -31,6 +39,7 @@ from openviking.session.causal_experiences import (
     FORK_CANDIDATE_ROLE,
     CausalExperiencesStore,
     ForkStatus,
+    branch_retrieval_channel,
 )
 from openviking.session.influence_projection import InfluenceProjection, ProjectionRegistry
 from openviking.session.influence_view import InfluenceClaim, InfluenceViewRevision
@@ -299,11 +308,13 @@ class AssembledPath:
 class RetrievalResult:
     cards: tuple[RetrievalCard, ...]
     feature_version: str
+    truncated_by_rerank_clamp: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "cards": [card.to_dict() for card in self.cards],
             "feature_version": self.feature_version,
+            "truncated_by_rerank_clamp": self.truncated_by_rerank_clamp,
         }
 
 
@@ -312,8 +323,13 @@ class CorpusAdapter(Protocol):
 
     name: str
 
-    def search(self, query: RetrievalQuery, limit: int) -> list[RetrievalCard]:
-        """Return at most ``limit`` cards for ``query``."""
+    def search(
+        self,
+        query: RetrievalQuery,
+        limit: int,
+        principal_labels: Sequence[str],
+    ) -> list[RetrievalCard]:
+        """Return at most ``limit`` cards visible to ``principal_labels``."""
 
 
 class RerankHook(Protocol):
@@ -372,14 +388,30 @@ def _limit(limit: int) -> int:
     return limit
 
 
+def _principal_set(principal_labels: Sequence[str]) -> set[str]:
+    if isinstance(principal_labels, (str, bytes)) or not isinstance(principal_labels, Sequence):
+        raise ValueError("principal_labels must be a sequence of str")
+    return set(principal_labels)
+
+
+def _labels_visible(labels: Sequence[str], principal: set[str]) -> bool:
+    return bool(principal.intersection(labels))
+
+
 class ForkBranchAdapter:
     """Wraps ``CausalExperiencesStore`` reads. Latest revision only.
 
     Validated revisions enter the verified channel. Provisional revisions are
     consumed as ForkCandidate and enter the provisional channel. Draft and
-    invalidated revisions stay out of retrieval. Branches share the parent
-    revision's channel. ACL labels are the fork workspace id: the store has
-    no separate label column.
+    invalidated revisions stay out of retrieval. A branch card uses
+    ``branch_retrieval_channel`` on its own evidence status; it does not
+    inherit the parent revision channel. ACL labels are the fork workspace id:
+    the store has no separate label column. Invisible cards are dropped before
+    the quota is spent.
+
+    Online code must not call ``materialize_strength(None)``, ``events()``,
+    ``list_bridges``, or ``ProjectionRegistry.to_dict``. Those are offline
+    management dumps and do not apply principal ACL.
     """
 
     name = "fork_branch"
@@ -388,9 +420,16 @@ class ForkBranchAdapter:
         self._root = Path(root)
         self._store = store if store is not None else CausalExperiencesStore(self._root)
 
-    def search(self, query: RetrievalQuery | Mapping[str, Any] | None, limit: int) -> list[RetrievalCard]:
+    def search(
+        self,
+        query: RetrievalQuery | Mapping[str, Any] | None,
+        limit: int,
+        principal_labels: Sequence[str] = (),
+    ) -> list[RetrievalCard]:
+        """ACL-filter fork and branch cards, then keep at most ``limit`` visible ones."""
         parsed = coerce_query(query)
         cap = _limit(limit)
+        principal = _principal_set(principal_labels)
         cards: list[RetrievalCard] = []
         for fork_node_id in self._fork_ids():
             loaded = self._store.get_fork_node(fork_node_id)
@@ -408,7 +447,12 @@ class ForkBranchAdapter:
             blob = json.dumps(latest, ensure_ascii=False, sort_keys=True)
             if not _text_hits(parsed, blob):
                 continue
-            labels = _normalize_labels((str(latest.get("workspace_id") or ""),))
+            raw_workspace = latest.get("workspace_id")
+            if not isinstance(raw_workspace, str) or not raw_workspace:
+                continue
+            labels = _normalize_labels((raw_workspace,))
+            if not _labels_visible(labels, principal):
+                continue
             revision_id = str(latest.get("revision_id") or "")
             fork_card = RetrievalCard(
                 kind="fork",
@@ -434,10 +478,13 @@ class ForkBranchAdapter:
                 branch_id = str(branch.get("branch_id") or "")
                 if not branch_id:
                     continue
+                branch_channel = branch_retrieval_channel(branch, status)
+                if branch_channel not in CARD_CHANNELS or branch_channel == "fact":
+                    continue
                 cards.append(
                     RetrievalCard(
                         kind="branch",
-                        channel=channel,
+                        channel=branch_channel,  # type: ignore[arg-type]
                         in_channel_rank=0,
                         status_label=_status_label_for_fork(status),
                         source_pointer={
@@ -516,7 +563,11 @@ class InfluenceProjectionAdapter:
 
     Claim signature fields are read from the bound frozen view (the projection
     card stores them only inside its summary). Neighborhood expansion walks
-    claim edges of that same view and never writes the registry.
+    claim edges of that same view and never writes the registry. Online search
+    calls ``ProjectionRegistry.search`` with ``principal_labels`` and never
+    ``to_dict``. ``materialize_strength(None)``, ``events()``, and
+    ``list_bridges`` are offline management paths; online code must not call
+    them.
     """
 
     name = "projection"
@@ -536,16 +587,22 @@ class InfluenceProjectionAdapter:
             raise ValueError("revision must be an InfluenceViewRevision")
         self._views[revision.revision_id] = revision
 
-    def search(self, query: RetrievalQuery | Mapping[str, Any] | None, limit: int) -> list[RetrievalCard]:
+    def search(
+        self,
+        query: RetrievalQuery | Mapping[str, Any] | None,
+        limit: int,
+        principal_labels: Sequence[str] = (),
+    ) -> list[RetrievalCard]:
+        """ACL via ``ProjectionRegistry.search``, then keep at most ``limit`` hits.
+
+        Does not call ``ProjectionRegistry.to_dict``. That dump, along with
+        ``materialize_strength(None)``, ``events()``, and ``list_bridges``, is
+        an offline management path and must not be used online.
+        """
         parsed = coerce_query(query)
         cap = _limit(limit)
         pattern = parsed.dependency_pattern
-        raw_cards = [
-            InfluenceProjection.from_dict(entry["card"])
-            for entry in self._registry.to_dict()["entries"]
-            if isinstance(entry, dict) and isinstance(entry.get("card"), dict)
-        ]
-        raw_cards.sort(key=lambda card: (card.created_at, card.card_id))
+        raw_cards = list(self._registry.search(principal_labels=principal_labels))
         cards: list[RetrievalCard] = []
         for card in raw_cards:
             fields = _claim_fields(card, self._views)
@@ -698,8 +755,9 @@ class SegmentAtomAdapter:
     """Wraps ``list_ao_ledger``. Facts use channel ``fact`` and skip 8/4 slotting.
 
     ``action.record_kind == "segment"`` selects a segment card; every other AO
-    is an atom. Labels come from ``action.acl_labels`` when present, otherwise
-    the session id.
+    is an atom. Labels come only from ``action.acl_labels``. An action with no
+    labels is rejected and stays invisible: the session id is not used as a
+    stand-in label, and the row does not consume quota.
     """
 
     name = "segment_atom"
@@ -708,9 +766,16 @@ class SegmentAtomAdapter:
         self._session_dir = Path(session_dir)
         self._session_id = _require_str(session_id, "session_id")
 
-    def search(self, query: RetrievalQuery | Mapping[str, Any] | None, limit: int) -> list[RetrievalCard]:
+    def search(
+        self,
+        query: RetrievalQuery | Mapping[str, Any] | None,
+        limit: int,
+        principal_labels: Sequence[str] = (),
+    ) -> list[RetrievalCard]:
+        """Drop unlabeled or non-intersecting facts, then keep at most ``limit``."""
         parsed = coerce_query(query)
         cap = _limit(limit)
+        principal = _principal_set(principal_labels)
         cards: list[RetrievalCard] = []
         for item in self._items():
             action = item.get("action") if isinstance(item.get("action"), dict) else {}
@@ -721,10 +786,11 @@ class SegmentAtomAdapter:
             record_kind = action.get("record_kind")
             kind: CardKind = "segment" if record_kind == "segment" else "atom"
             raw_labels = action.get("acl_labels")
-            if isinstance(raw_labels, list) and raw_labels:
-                labels = _normalize_labels(tuple(str(label) for label in raw_labels))
-            else:
-                labels = (self._session_id,)
+            if not isinstance(raw_labels, list) or not raw_labels:
+                continue
+            labels = _normalize_labels(tuple(str(label) for label in raw_labels))
+            if not _labels_visible(labels, principal):
+                continue
             ao_id = str(item.get("ao_id") or "")
             cards.append(
                 RetrievalCard(
@@ -796,7 +862,12 @@ def _allocate_stateful(cards: Sequence[RetrievalCard]) -> list[RetrievalCard]:
 
 
 class HybridRetrievalFacade:
-    """One retrieve call over fork/branch, projection, and segment/atom."""
+    """One retrieve call over fork/branch, projection, and segment/atom.
+
+    Online code must not call ``materialize_strength(None)``, ``events()``,
+    ``list_bridges``, or ``ProjectionRegistry.to_dict``. Those are offline
+    management paths and do not apply principal ACL.
+    """
 
     def __init__(
         self,
@@ -821,18 +892,26 @@ class HybridRetrievalFacade:
         principal_labels: Sequence[str],
         profile: RetrievalProfile | Mapping[str, Any] | None = None,
     ) -> RetrievalResult:
+        """Filter inside each adapter, then clamp reranked cards back to 12.
+
+        ``materialize_strength(None)``, ``events()``, ``list_bridges``, and
+        ``ProjectionRegistry.to_dict`` are offline management paths. This
+        method does not call them.
+        """
         parsed = coerce_query(query)
         budgets = coerce_profile(profile)
-        if isinstance(principal_labels, (str, bytes)) or not isinstance(principal_labels, Sequence):
-            raise ValueError("principal_labels must be a sequence of str")
+        _principal_set(principal_labels)
         fork_cards = self._visible(
-            self.fork_branch.search(parsed, budgets.fork_branch), principal_labels
+            self.fork_branch.search(parsed, budgets.fork_branch, principal_labels),
+            principal_labels,
         )
         projection_cards = self._visible(
-            self.projection.search(parsed, budgets.projection), principal_labels
+            self.projection.search(parsed, budgets.projection, principal_labels),
+            principal_labels,
         )
         fact_cards = self._visible(
-            self.segment_atom.search(parsed, budgets.segment_atom), principal_labels
+            self.segment_atom.search(parsed, budgets.segment_atom, principal_labels),
+            principal_labels,
         )
         stateful = _allocate_stateful([*fork_cards, *projection_cards])
         facts = _assign_ranks(fact_cards, "fact")
@@ -843,7 +922,13 @@ class HybridRetrievalFacade:
             "profile": budgets.to_dict(),
         }
         reranked = self._call_rerank(selected, context)
-        return RetrievalResult(cards=tuple(reranked), feature_version=self.feature_version)
+        truncated = len(reranked) > CAUSAL_MEMORY_CAP
+        clamped = reranked[:CAUSAL_MEMORY_CAP]
+        return RetrievalResult(
+            cards=tuple(clamped),
+            feature_version=self.feature_version,
+            truncated_by_rerank_clamp=truncated,
+        )
 
     def expand_claim_neighborhood(
         self,

@@ -46,6 +46,25 @@ _EVIDENCE = {
     "independent_control_refs": [
         {"ref_kind": "independent_control", "ref_id": "ctrl-1"}
     ],
+    "anchor_valid": {"valid": True, "checked_at": "2026-01-02T00:00:00.000Z"},
+    "applicability_check": {
+        "task_decision_type": "applicable",
+        "anchor_state": "applicable",
+        "failure_mode": "applicable",
+        "action_skill_role": "applicable",
+    },
+    "counter_example_check": {"conclusion": "no_counter_example", "refs": ["run-1"]},
+    "no_high_severity_contradictions": True,
+    "control_contract": {
+        "anchor_state_snapshot": "snap-1",
+        "task_input": "task-input-1",
+        "agent_model_prompt_policy": "policy-v1",
+        "tool_dependency_versions": {"toolkit": "1.0.0"},
+        "permissions": "read-only",
+        "budget": "1000",
+        "evaluator": "evaluator-v1",
+        "frozen_at": "2026-01-02T00:00:00.000Z",
+    },
 }
 _PRINCIPAL = ("team-a",)
 _CREATED = "2026-01-02T00:00:00.000Z"
@@ -164,6 +183,7 @@ def _freeze(
     *,
     revision_id: str,
     session_id: str = "sess-1",
+    enforce_checks: bool = True,
 ):
     draft = InfluenceViewDraft(
         view_id=f"view-{revision_id}",
@@ -174,7 +194,11 @@ def _freeze(
         blocks=blocks,
         claims=claims,
     )
-    return draft.freeze(revision_id=revision_id, frozen_at=_CREATED)
+    return draft.freeze(
+        revision_id=revision_id,
+        frozen_at=_CREATED,
+        enforce_checks=enforce_checks,
+    )
 
 
 def _facade(
@@ -404,7 +428,7 @@ def test_dependency_pattern_and_bounded_neighborhood(tmp_path: Path) -> None:
     registry.promote_to_verified(
         revision.revision_id,
         "c-match",
-        {"fork_revision_id": "fr-1"},
+        {"fork_node_id": "fk-static-1", "fork_revision_id": "fr-1"},
     )
     session_dir = root / "sess"
     AOLedger(session_dir, "sess")
@@ -462,7 +486,13 @@ def test_dependency_pattern_and_bounded_neighborhood(tmp_path: Path) -> None:
             relation_type="influence",
         ),
     ]
-    cycle = _freeze(cycle_blocks, cycle_claims, revision_id="rev-cycle", session_id="sess-cycle")
+    cycle = _freeze(
+        cycle_blocks,
+        cycle_claims,
+        revision_id="rev-cycle",
+        session_id="sess-cycle",
+        enforce_checks=False,  # deliberately invalid view: read-side truncation is defense-in-depth
+    )
     facade.projection.bind_view(chain)
     facade.projection.bind_view(cycle)
     registry_bytes = (root / "projections.json").read_bytes()
@@ -534,3 +564,120 @@ def test_fact_channel_does_not_consume_state_slots(tmp_path: Path) -> None:
     assert {card.source_pointer["ao_id"] for card in facts} == {segment_id, atom_id}
     assert all(card.in_channel_rank >= 1 for card in facts)
     assert not any(card.channel in {"verified", "provisional"} for card in facts)
+
+
+def test_acl_does_not_consume_quota(tmp_path: Path) -> None:
+    root = tmp_path / "acl-quota"
+    store = _store(root)
+    for index in range(12):
+        _commit_fork(store, ao_id=f"ao-hidden-{index}", workspace="secret", status="validated")
+    visible = _commit_fork(store, ao_id="ao-visible-late", workspace="team-a", status="validated")
+    registry = ProjectionRegistry(root / "projections.json")
+    session_dir = root / "sess"
+    AOLedger(session_dir, "sess")
+    facade = _facade(root, store, registry, session_dir, "sess")
+    result = facade.retrieve(
+        {},
+        _PRINCIPAL,
+        RetrievalProfile(fork_branch=12, projection=0, segment_atom=0),
+    )
+    fork_ids = [card.source_pointer["fork_node_id"] for card in result.cards if card.kind == "fork"]
+    assert visible in fork_ids
+    assert all(card.source_pointer.get("fork_node_id") != visible or card.acl_labels == _PRINCIPAL for card in result.cards)
+    assert all(set(card.acl_labels) & set(_PRINCIPAL) for card in result.cards)
+
+
+class _OverflowRerank:
+    def rerank(self, cards, context):
+        del context
+        seed = cards[0]
+        return [seed for _ in range(13)]
+
+
+def test_rerank_clamp_restores_cap(tmp_path: Path) -> None:
+    root = tmp_path / "rerank-cap"
+    store = _store(root)
+    _commit_fork(store, ao_id="ao-one", workspace="team-a", status="validated")
+    registry = ProjectionRegistry(root / "projections.json")
+    session_dir = root / "sess"
+    AOLedger(session_dir, "sess")
+    projection = InfluenceProjectionAdapter(registry)
+    facade = HybridRetrievalFacade(
+        ForkBranchAdapter(root, store),
+        projection,
+        SegmentAtomAdapter(session_dir, "sess"),
+        rerank=_OverflowRerank(),
+    )
+    result = facade.retrieve(
+        {},
+        _PRINCIPAL,
+        RetrievalProfile(fork_branch=6, projection=0, segment_atom=0),
+    )
+    assert len(result.cards) <= 12
+    assert len(result.cards) == 12
+    assert result.truncated_by_rerank_clamp is True
+    assert {card.in_channel_rank for card in result.cards} == {1}
+
+
+def test_branch_channel_follows_own_evidence(tmp_path: Path) -> None:
+    root = tmp_path / "branch-channel"
+    store = _store(root)
+    _commit_fork(
+        store,
+        ao_id="ao-mixed",
+        workspace="team-a",
+        status="validated",
+        branches=[
+            {
+                "branch_id": "br-imag",
+                "evidence_status": "imagined_unverified",
+                "ao_sequence": ["ao-imag"],
+                "guidance": None,
+            },
+            {
+                "branch_id": "br-real",
+                "evidence_status": "real",
+                "ao_sequence": ["ao-real"],
+                "guidance": None,
+            },
+        ],
+    )
+    registry = ProjectionRegistry(root / "projections.json")
+    session_dir = root / "sess"
+    AOLedger(session_dir, "sess")
+    facade = _facade(root, store, registry, session_dir, "sess")
+    result = facade.retrieve(
+        {},
+        _PRINCIPAL,
+        RetrievalProfile(fork_branch=6, projection=0, segment_atom=0),
+    )
+    branches = {card.source_pointer["branch_id"]: card for card in result.cards if card.kind == "branch"}
+    assert branches["br-imag"].channel == "provisional"
+    assert branches["br-real"].channel == "verified"
+
+
+def test_projection_adapter_hides_invisible_cards(tmp_path: Path) -> None:
+    root = tmp_path / "proj-acl"
+    visible_rev = _freeze(
+        [_block("b-vis", 1, session_id="sess-vis")],
+        [],
+        revision_id="rev-vis",
+        session_id="sess-vis",
+    )
+    hidden_rev = _freeze(
+        [_block("b-hid", 1, session_id="sess-hid")],
+        [],
+        revision_id="rev-hid",
+        session_id="sess-hid",
+    )
+    registry = ProjectionRegistry(root / "projections.json")
+    registry.register(visible_rev, acl_labels=("team-a",))
+    registry.register(hidden_rev, acl_labels=("secret",))
+    adapter = InfluenceProjectionAdapter(registry, views=[visible_rev, hidden_rev])
+    cards = adapter.search({}, 10, _PRINCIPAL)
+    registry_ids = {card.card_id for card in registry.search(principal_labels=_PRINCIPAL)}
+    assert {card.payload_ref for card in cards} == registry_ids
+    assert registry_ids
+    assert all(card.source_pointer["view_revision_id"] != "rev-hid" for card in cards)
+    dumped = {entry["card"]["card_id"] for entry in registry.to_dict()["entries"]}
+    assert len(dumped) > len(registry_ids)
