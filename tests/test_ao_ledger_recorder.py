@@ -100,6 +100,34 @@ def test_record_tool_exchange_dict_and_str(tmp_path: Path) -> None:
     assert recorder.ledger.count() == 2
 
 
+def test_record_messages_skips_duplicate_message_and_tool_call(tmp_path: Path) -> None:
+    recorder = AOLedgerRecorder(tmp_path / "sess-dedup", "sess-dedup")
+    tool_msg = Message(
+        id="m-dup",
+        role="assistant",
+        parts=[
+            ToolPart(
+                tool_id="call-1",
+                tool_name="read_file",
+                tool_input={"path": "a.md"},
+                tool_output="hello",
+                tool_status="completed",
+            )
+        ],
+    )
+    first = recorder.record_messages([tool_msg])
+    second = recorder.record_messages([tool_msg])
+    assert len(first) == 1
+    assert second == []
+    assert recorder.ledger.count() == 1
+    assert recorder.duplicate_skip_count == 1
+
+    reloaded = AOLedgerRecorder(tmp_path / "sess-dedup", "sess-dedup")
+    assert reloaded.record_messages([tool_msg]) == []
+    assert reloaded.ledger.count() == 1
+    assert reloaded.duplicate_skip_count == 1
+
+
 def test_record_tool_exchange_adds_artifact_ref(tmp_path: Path) -> None:
     recorder = AOLedgerRecorder(tmp_path, "sess-ref")
     artifact = "viking://user/default/sessions/s/tool-results/tr_abc"

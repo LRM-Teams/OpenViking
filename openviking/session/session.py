@@ -951,6 +951,21 @@ class Session:
             self._stats.skills_used += 1
             logger.debug(f"Tracked skill usage: {skill.get('uri')}")
             try:
+                from openviking.session.ao_ledger import note_skill_invocation
+
+                raw_revision = skill.get("revision_hash")
+                raw_invocation = skill.get("invocation_id")
+                raw_tool_call = skill.get("tool_call_id") or skill.get("tool_id")
+                note_skill_invocation(
+                    self.session_id,
+                    skill_uri=str(skill.get("skill_uri") or skill.get("uri") or "") or None,
+                    revision_hash=raw_revision if isinstance(raw_revision, str) else None,
+                    invocation_id=raw_invocation if isinstance(raw_invocation, str) else None,
+                    tool_call_id=str(raw_tool_call) if raw_tool_call else None,
+                )
+            except Exception:
+                logger.warning("Failed to register skill invocation for AO ledger", exc_info=True)
+            try:
                 from openviking.metrics.datasources.session import SessionLifecycleDataSource
 
                 SessionLifecycleDataSource.record_contexts_used(action="skill", delta=1)

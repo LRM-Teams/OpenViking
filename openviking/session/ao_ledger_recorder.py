@@ -10,6 +10,7 @@ cannot break (ADR-0002: attribution is a separate append-only file).
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -188,12 +189,27 @@ def _has_tool_result(part: Any) -> bool:
 
 
 def _tool_call_dict(part: Any) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "tool": getattr(part, "tool_name", "") or "",
         "tool_name": getattr(part, "tool_name", "") or "",
         "tool_id": getattr(part, "tool_id", "") or "",
         "arguments": getattr(part, "tool_input", None) or {},
     }
+    skill_uri = getattr(part, "skill_uri", "") or ""
+    if skill_uri:
+        payload["skill_uri"] = skill_uri
+    return payload
+
+
+def _exchange_dedup_key(message_ref: dict[str, Any] | None) -> tuple[str, str] | None:
+    """Dedup key ``(message_id, tool_call_id)``. Incomplete refs are not keyed."""
+    if not message_ref:
+        return None
+    message_id = str(message_ref.get("message_id") or "")
+    tool_call_id = str(message_ref.get("tool_call_id") or message_ref.get("tool_id") or "")
+    if not message_id or not tool_call_id:
+        return None
+    return message_id, tool_call_id
 
 
 def _tool_result_payload(part: Any) -> Any:
@@ -239,6 +255,13 @@ class AOLedgerRecorder:
         self.session_id = session_id
         self.session_dir = Path(session_dir)
         self.ledger = AOLedger(self.session_dir, session_id)
+        self.duplicate_skip_count = 0
+        self._seen_exchange_keys: set[tuple[str, str]] = set()
+        self._dedup_lock = threading.Lock()
+        for record in self.ledger.records():
+            key = _exchange_dedup_key(record.message_ref)
+            if key is not None:
+                self._seen_exchange_keys.add(key)
 
     def record_tool_exchange(
         self,
@@ -246,8 +269,27 @@ class AOLedgerRecorder:
         tool_result: Any,
         message_ref: dict[str, Any] | None = None,
     ) -> AORecord | None:
-        """Append one AO pair. Failures are logged and do not raise."""
+        """Append one AO pair. Failures are logged and do not raise.
+
+        A repeat of the same ``(message_id, tool_call_id)`` is skipped, counted
+        on ``duplicate_skip_count``, and logged at debug. The tool call id is
+        ``message_ref['tool_call_id']`` or the session ``tool_id`` alias.
+        """
+        dedup_key = _exchange_dedup_key(message_ref)
+        claimed = False
         try:
+            if dedup_key is not None:
+                with self._dedup_lock:
+                    if dedup_key in self._seen_exchange_keys:
+                        self.duplicate_skip_count += 1
+                        logger.debug(
+                            "skip duplicate AO record message_id=%s tool_call_id=%s",
+                            dedup_key[0],
+                            dedup_key[1],
+                        )
+                        return None
+                    self._seen_exchange_keys.add(dedup_key)
+                    claimed = True
             action = _action_from_tool_call(dict(tool_call))
             observation = build_observation(_observation_content(tool_result))
             artifact_ref = _extract_artifact_ref(tool_call, tool_result, message_ref)
@@ -256,10 +298,15 @@ class AOLedgerRecorder:
             return self.ledger.append(
                 action=action,
                 observation=observation,
-                skill_invocations=extract_skill_invocations(tool_call),
+                skill_invocations=extract_skill_invocations(
+                    dict(tool_call), session_id=self.session_id
+                ),
                 message_ref=message_ref,
             )
         except Exception:
+            if claimed and dedup_key is not None:
+                with self._dedup_lock:
+                    self._seen_exchange_keys.discard(dedup_key)
             logger.warning("AO ledger record_tool_exchange failed", exc_info=True)
             return None
 

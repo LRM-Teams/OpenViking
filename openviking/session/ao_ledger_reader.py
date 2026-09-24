@@ -5,7 +5,8 @@
 ``list_ao_ledger`` pages a watermark-frozen view (archive set + live upper
 bound). ``get_ao_evidence`` returns one record plus its attribution; an
 optional ``acl_check`` hook is the source-session ACL authority (Q28).
-This slice leaves the hook unset (allow); a later slice wires real ACL.
+When the hook is omitted, a registered ``AclPolicy`` is consulted.
+Unregistered sessions are default-deny; nothing silently allows every read.
 """
 
 from __future__ import annotations
@@ -14,11 +15,12 @@ import base64
 import hashlib
 import json
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from openviking.session.ao_ledger import AOAttribution, AOLedger, AORecord
 from openviking.session.ao_ledger_recorder import (
@@ -32,6 +34,52 @@ _CURSOR_PREFIX = "seq:"
 _SNAPSHOT_VERSION = 1
 
 logger = logging.getLogger(__name__)
+
+
+class AclPolicy(Protocol):
+    """Source-session visibility policy. Implementations must fail closed."""
+
+    def allows(self, session_id: str, record: dict[str, Any]) -> bool:
+        """Return whether ``record`` from ``session_id`` may be read as evidence."""
+
+
+class DefaultDenyAcl:
+    """Explicit deny. Used when no session policy has been registered."""
+
+    def allows(self, session_id: str, record: dict[str, Any]) -> bool:
+        del session_id, record
+        return False
+
+
+_acl_lock = threading.Lock()
+_session_acls: dict[str, AclPolicy] = {}
+_DEFAULT_ACL = DefaultDenyAcl()
+
+
+def register_session_acl(session_id: str, policy: AclPolicy) -> None:
+    """Install the visibility policy for one source session.
+
+    Later ``get_ao_evidence`` calls that omit ``acl_check`` use this policy.
+    Registering is the only way to permit a read; the default is deny.
+    """
+    if not session_id:
+        raise ValueError("session_id is required")
+    with _acl_lock:
+        _session_acls[session_id] = policy
+
+
+def _session_acl(session_id: str) -> AclPolicy:
+    with _acl_lock:
+        return _session_acls.get(session_id, _DEFAULT_ACL)
+
+
+def _registered_acl_check(session_id: str, record: dict[str, Any]) -> bool:
+    policy = _session_acl(session_id)
+    try:
+        return bool(policy.allows(session_id, record))
+    except Exception:
+        logger.warning("session ACL check failed; denying", exc_info=True)
+        return False
 
 
 def _utc_now_iso() -> str:
@@ -250,7 +298,12 @@ def list_ao_ledger(
     First call (no watermark) issues a snapshot. A cursor must be paired
     with the same watermark that produced it; a mismatch raises
     ``ValueError``. ``include_live=False`` returns only attributed
-    (committed) AOs. ``limit`` above ``MAX_PAGE_LIMIT`` is truncated.
+    (committed) AOs. ``include_live=True`` also returns live rows still
+    inside the frozen snapshot. This list does not apply source-session
+    ACL: ``include_live`` is not an evidence bypass. Drill-down goes
+    through ``get_ao_evidence``, which is default-deny unless
+    ``register_session_acl`` installed a policy or the caller passes
+    ``acl_check``. ``limit`` above ``MAX_PAGE_LIMIT`` is truncated.
     """
     if cursor and not snapshot_watermark:
         raise ValueError("cursor requires snapshot_watermark")
@@ -290,6 +343,10 @@ def list_ao_ledger(
     visible: list[tuple[AORecord, AOAttribution | None]] = []
     for record in records:
         attr = attributions.get(record.ao_id)
+        # include_live adds unattributed rows from the frozen snapshot only.
+        # Source-session ACL is enforced on get_ao_evidence (default-deny
+        # unless register_session_acl installed a policy). Listing live rows
+        # does not grant an evidence read.
         if attr is None and not include_live:
             continue
         visible.append((record, attr))
@@ -318,10 +375,11 @@ def get_ao_evidence(
 ) -> dict[str, Any] | None:
     """Return one AO record and its archive attribution, if any.
 
-    ``acl_check(source_session_id, record_dict)`` is an optional hook for
-    the source-session ACL (the authority per Q28). ``None`` allows the
-    read; a later slice will supply the real checker. Returning ``False``
-    raises ``PermissionError``. Missing ``ao_id`` returns ``None``.
+    ``acl_check(source_session_id, record_dict)`` overrides the registered
+    source-session policy (Q28). When it is omitted, ``register_session_acl``
+    supplies the policy. No registration means ``DefaultDenyAcl`` — the read
+    is refused. A check that returns ``False`` raises ``PermissionError``.
+    Missing ``ao_id`` returns ``None`` before the ACL check.
     """
     session_path = Path(session_dir)
     ledger = AOLedger(session_path, session_path.name)
@@ -330,7 +388,8 @@ def get_ao_evidence(
         return None
 
     record_dict = record.to_dict()
-    if acl_check is not None and not acl_check(record.session_id, record_dict):
+    checker = acl_check if acl_check is not None else _registered_acl_check
+    if not checker(record.session_id, record_dict):
         raise PermissionError(f"ACL denied for ao_id {ao_id}")
 
     attr = _find_attribution(session_path, ao_id)

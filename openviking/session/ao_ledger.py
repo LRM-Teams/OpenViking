@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import threading
 import uuid
+from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,9 +25,12 @@ from openviking.session.tool_result_synopsis import (
 
 LEDGER_FILENAME = "ao-ledger.jsonl"
 CAPTURED_STATE_LIVE = "live"
+UNKNOWN_SKILL_FIELD = "unknown"
 _ACTION_PARAM_LIMIT = 2048
 _SYNOPSIS_PREVIEW_CHARS = 500
 _PARAM_KEYS = ("arguments", "params", "parameters", "args")
+_SKILL_INVOCATION_BUFFER_LIMIT = 64
+_TOOL_CALL_ID_KEYS = ("tool_call_id", "tool_id")
 
 
 def _utc_now_iso() -> str:
@@ -83,15 +87,162 @@ def _sanitize_action(action: dict[str, Any]) -> dict[str, Any]:
     return sanitized
 
 
-def extract_skill_invocations(tool_call: dict[str, Any]) -> list[dict[str, Any]]:
-    """Runtime hook that collects skill invocations for an AO record.
+@dataclass(frozen=True)
+class _PendingSkillInvocation:
+    skill_uri: str
+    revision_hash: str
+    invocation_id: str | None
+    tool_call_id: str | None
 
-    v1 always returns ``[]``. Later slices will attach real skill_uri /
-    revision_hash / invocation_id from the call path. Callers must still
-    persist the field (empty list, never omitted).
+
+_skill_invocation_lock = threading.Lock()
+_pending_skill_invocations: dict[str, deque[_PendingSkillInvocation]] = {}
+
+
+def _skill_field(value: str | None) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return UNKNOWN_SKILL_FIELD
+
+
+def _optional_id(value: str | None) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def note_skill_invocation(
+    session_id: str,
+    *,
+    skill_uri: str | None = None,
+    revision_hash: str | None = None,
+    invocation_id: str | None = None,
+    tool_call_id: str | None = None,
+) -> None:
+    """Register one runtime skill invocation for a later AO capture.
+
+    The skill execution path (``Session.used``) and ``add_messages`` capture
+    are not the same call chain. This per-session ring buffer is the hand-off.
+    ``extract_skill_invocations`` consumes entries aligned by tool call id and
+    clears them. Missing ``skill_uri`` or ``revision_hash`` is stored as the
+    structured token ``unknown`` — never invented, and never inferred from
+    message text. ``session/skill/`` updates skill assets and does not carry a
+    content revision at execution time.
     """
-    del tool_call
-    return []
+    if not session_id:
+        return
+    entry = _PendingSkillInvocation(
+        skill_uri=_skill_field(skill_uri),
+        revision_hash=_skill_field(revision_hash),
+        invocation_id=_optional_id(invocation_id),
+        tool_call_id=_optional_id(tool_call_id),
+    )
+    with _skill_invocation_lock:
+        buffer = _pending_skill_invocations.setdefault(
+            session_id, deque(maxlen=_SKILL_INVOCATION_BUFFER_LIMIT)
+        )
+        buffer.append(entry)
+
+
+def _invocation_dict(entry: _PendingSkillInvocation) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "skill_uri": entry.skill_uri,
+        "revision_hash": entry.revision_hash,
+    }
+    if entry.invocation_id:
+        payload["invocation_id"] = entry.invocation_id
+    return payload
+
+
+def _tool_call_ids(tool_call: dict[str, Any]) -> set[str]:
+    found: set[str] = set()
+    for key in _TOOL_CALL_ID_KEYS:
+        value = tool_call.get(key)
+        if value:
+            found.add(str(value))
+    return found
+
+
+def _consume_pending_skill_invocations(
+    session_id: str, tool_call: dict[str, Any]
+) -> list[dict[str, Any]]:
+    call_ids = _tool_call_ids(tool_call)
+    with _skill_invocation_lock:
+        buffer = _pending_skill_invocations.get(session_id)
+        if not buffer:
+            return []
+        pending = list(buffer)
+        matched = [
+            entry
+            for entry in pending
+            if entry.tool_call_id and entry.tool_call_id in call_ids
+        ]
+        if matched:
+            rest = [entry for entry in pending if entry not in matched]
+        else:
+            unkeyed = [entry for entry in pending if not entry.tool_call_id]
+            if not unkeyed:
+                return []
+            matched = unkeyed
+            rest = [entry for entry in pending if entry.tool_call_id]
+        if rest:
+            _pending_skill_invocations[session_id] = deque(
+                rest, maxlen=_SKILL_INVOCATION_BUFFER_LIMIT
+            )
+        else:
+            _pending_skill_invocations.pop(session_id, None)
+        return [_invocation_dict(entry) for entry in matched]
+
+
+def _structured_tool_skill(tool_call: dict[str, Any]) -> list[dict[str, Any]]:
+    """Use a structured ``skill_uri`` already on the tool call.
+
+    ``ToolPart.skill_uri`` is set on the execution record. It is not prose.
+    That part does not carry ``revision_hash``, so the hash is the structured
+    token ``unknown`` rather than a fabricated digest.
+    """
+    skill_uri = tool_call.get("skill_uri")
+    if not isinstance(skill_uri, str) or not skill_uri.strip():
+        return []
+    payload: dict[str, Any] = {
+        "skill_uri": skill_uri.strip(),
+        "revision_hash": UNKNOWN_SKILL_FIELD,
+    }
+    invocation_id = _optional_id(
+        tool_call.get("invocation_id") if isinstance(tool_call.get("invocation_id"), str) else None
+    )
+    if invocation_id:
+        payload["invocation_id"] = invocation_id
+    return [payload]
+
+
+def extract_skill_invocations(
+    tool_call: dict[str, Any],
+    session_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Collect skill invocations captured for this tool call.
+
+    Order of sources (never message-text inference):
+
+    1. The per-session ring buffer filled by ``note_skill_invocation``.
+       Entries bound to this tool call id are consumed and removed. When
+       nothing is bound to the id, unbound recent entries are consumed once
+       and removed; entries bound to other tool calls stay.
+    2. A structured ``skill_uri`` on ``tool_call`` itself, with
+       ``revision_hash`` ``unknown`` when the execution path did not supply a
+       revision (see ``_structured_tool_skill``).
+
+    No registered invocation and no structured ``skill_uri`` yields ``[]``.
+    Callers must still persist the field.
+    """
+    if session_id:
+        captured = _consume_pending_skill_invocations(session_id, tool_call)
+        if captured:
+            return captured
+    return _structured_tool_skill(tool_call)
 
 
 def build_observation(tool_result_content: str | dict[str, Any]) -> dict[str, Any]:

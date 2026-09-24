@@ -18,7 +18,14 @@ from openviking.session.ao_ledger_reader import (
     get_ao_evidence,
     issue_snapshot,
     list_ao_ledger,
+    register_session_acl,
 )
+
+
+class _AllowSessionAcl:
+    def allows(self, session_id: str, record: dict) -> bool:
+        del session_id, record
+        return True
 
 
 def _action(n: int) -> dict:
@@ -182,6 +189,7 @@ def test_get_ao_evidence_attribution_and_acl(tmp_path: Path) -> None:
     ledger = AOLedger(session_dir, session_id)
     attributed, live = _append_n(ledger, 2)
     _write_attribution(session_dir, "archive_001", [attributed])
+    register_session_acl(session_id, _AllowSessionAcl())
 
     committed = get_ao_evidence(session_dir, attributed.ao_id)
     assert committed is not None
@@ -213,6 +221,32 @@ def test_get_ao_evidence_attribution_and_acl(tmp_path: Path) -> None:
     )
     assert allowed is not None
     assert allowed["record"]["ao_id"] == attributed.ao_id
+
+
+def test_get_ao_evidence_default_deny_without_registration(tmp_path: Path) -> None:
+    session_dir = tmp_path / "sess-deny"
+    session_id = "sess-deny"
+    ledger = AOLedger(session_dir, session_id)
+    record = _append_n(ledger, 1)[0]
+
+    with pytest.raises(PermissionError):
+        get_ao_evidence(session_dir, record.ao_id)
+
+
+def test_get_ao_evidence_allows_after_register(tmp_path: Path) -> None:
+    session_dir = tmp_path / "sess-allow"
+    session_id = "sess-allow"
+    ledger = AOLedger(session_dir, session_id)
+    record = _append_n(ledger, 1)[0]
+
+    with pytest.raises(PermissionError):
+        get_ao_evidence(session_dir, record.ao_id)
+
+    register_session_acl(session_id, _AllowSessionAcl())
+    evidence = get_ao_evidence(session_dir, record.ao_id)
+    assert evidence is not None
+    assert evidence["record"]["ao_id"] == record.ao_id
+    assert evidence["record"]["session_id"] == session_id
 
 
 def test_watermark_encode_decode_roundtrip(tmp_path: Path) -> None:
