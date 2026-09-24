@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import FrozenInstanceError, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+from openviking.session import citation_ledger as citation_ledger_module
 from openviking.session.citation_ledger import (
     CitationEvent,
     CitationLedger,
@@ -68,7 +70,7 @@ def test_same_task_and_cross_task_strengths_are_independent(tmp_path: Path) -> N
     _cite(ledger, task_id="task-other", role="considered")
     _cite(ledger, task_id="task-src", ref=OTHER_REF, role="compared")
 
-    strength = ledger.materialize_strength(REF, T0, policy)
+    strength = ledger.materialize_strength(REF, T0, policy, ["chan-a"])
 
     assert strength.in_task_reference_strength == pytest.approx(2.0)
     assert strength.cross_task_reference_strength == pytest.approx(1.0)
@@ -80,6 +82,7 @@ def test_same_task_and_cross_task_strengths_are_independent(tmp_path: Path) -> N
         {"type": "memory_hint", "id": "hint-1", "revision": "rev-2"},
         T0,
         policy,
+        ["chan-a"],
     )
     assert other.in_task_reference_strength == pytest.approx(1.0)
     assert other.cross_task_reference_strength == pytest.approx(0.0)
@@ -94,16 +97,16 @@ def test_decay_follows_half_life_and_policy_recompute_keeps_events(tmp_path: Pat
     _cite(ledger, task_id="task-src", role="applied")
     _cite(ledger, task_id="task-other", role="compared")
 
-    at_7 = ledger.materialize_strength(REF, T0 + timedelta(days=7), policy)
+    at_7 = ledger.materialize_strength(REF, T0 + timedelta(days=7), policy, ["chan-a"])
     assert at_7.in_task_reference_strength == pytest.approx(0.5)
     assert at_7.cross_task_reference_strength == pytest.approx(2 ** (-7 / 90))
 
-    at_90 = ledger.materialize_strength(REF, T0 + timedelta(days=90), policy)
+    at_90 = ledger.materialize_strength(REF, T0 + timedelta(days=90), policy, ["chan-a"])
     assert at_90.in_task_reference_strength == pytest.approx(2 ** (-90 / 7))
     assert at_90.cross_task_reference_strength == pytest.approx(0.5)
 
-    before_events = [event.to_dict() for event in ledger.events()]
-    before_ids = [id(event) for event in ledger.events()]
+    before_events = [event.to_dict() for event in ledger.events(require_admin=True)]
+    before_ids = [id(event) for event in ledger.events(require_admin=True)]
     before_bytes = ledger.path.read_bytes()
 
     revised = PolicyVersion(
@@ -111,7 +114,7 @@ def test_decay_follows_half_life_and_policy_recompute_keeps_events(tmp_path: Pat
         in_task_half_life_days=14,
         cross_task_half_life_days=180,
     )
-    recomputed = ledger.materialize_strength(REF, T0 + timedelta(days=7), revised)
+    recomputed = ledger.materialize_strength(REF, T0 + timedelta(days=7), revised, ["chan-a"])
     assert recomputed.in_task_reference_strength == pytest.approx(2 ** (-7 / 14))
     assert recomputed.cross_task_reference_strength == pytest.approx(2 ** (-7 / 180))
     assert recomputed.in_task_reference_strength != pytest.approx(at_7.in_task_reference_strength)
@@ -119,7 +122,7 @@ def test_decay_follows_half_life_and_policy_recompute_keeps_events(tmp_path: Pat
         at_7.cross_task_reference_strength
     )
 
-    after = ledger.events()
+    after = ledger.events(require_admin=True)
     assert [event.to_dict() for event in after] == before_events
     assert [id(event) for event in after] == before_ids
     assert all(event.policy_version == "p-v1" for event in after)
@@ -131,7 +134,7 @@ def test_index_and_hint_exposure_do_not_change_strength(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path, clock)
     policy = PolicyVersion(policy_id="p-v1")
     _cite(ledger, task_id="task-src", labels=["chan-a"])
-    baseline = ledger.materialize_strength(REF, T0, policy)
+    baseline = ledger.materialize_strength(REF, T0, policy, ["chan-a"])
     visible = ledger.visible_strength(REF, ["chan-a"], policy)
 
     ledger.record_hint_exposure(
@@ -163,7 +166,7 @@ def test_index_and_hint_exposure_do_not_change_strength(tmp_path: Path) -> None:
         policy_version="p-v1",
     )
 
-    assert ledger.materialize_strength(REF, T0, policy) == baseline
+    assert ledger.materialize_strength(REF, T0, policy, ["chan-a"]) == baseline
     assert ledger.visible_strength(REF, ["chan-a"], policy) == visible
     assert ledger.count_index_exposures(REF) == 2
     assert ledger.count_index_exposures(OTHER_REF) == 1
@@ -188,7 +191,9 @@ def test_citation_without_bridge_id_does_not_count_for_bridge(tmp_path: Path) ->
     assert ledger.bridge_citation_count("bridge-2") == 1
     assert ledger.bridge_citation_count("bridge-missing") == 0
 
-    strength = ledger.materialize_strength(REF, T0, PolicyVersion(policy_id="p-v1"))
+    strength = ledger.materialize_strength(
+        REF, T0, PolicyVersion(policy_id="p-v1"), ["chan-a"]
+    )
     assert strength.in_task_reference_strength == pytest.approx(3.0)
     assert strength.cross_task_reference_strength == pytest.approx(2.0)
 
@@ -264,16 +269,60 @@ def test_jsonl_roundtrip_is_lossless(tmp_path: Path) -> None:
     assert first_text in second_text
 
     reloaded = CitationLedger(path, clock=clock)
-    assert reloaded.events() == ledger.events()
-    for event in reloaded.events():
+    assert reloaded.events(require_admin=True) == ledger.events(require_admin=True)
+    for event in reloaded.events(require_admin=True):
         restored = CitationEvent.from_dict(json.loads(json.dumps(event.to_dict())))
         assert restored == event
 
     policy = PolicyVersion(policy_id="p-custom", in_task_half_life_days=3, cross_task_half_life_days=10)
     assert PolicyVersion.from_dict(json.loads(json.dumps(policy.to_dict()))) == policy
-    assert [event.kind for event in reloaded.events()] == [
+    assert [event.kind for event in reloaded.events(require_admin=True)] == [
         "citation",
         "hint_exposure",
         "index_level_exposure",
     ]
-    assert reloaded.events()[1].occurred_at != reloaded.events()[0].occurred_at
+    assert reloaded.events(require_admin=True)[1].occurred_at != reloaded.events(require_admin=True)[0].occurred_at
+
+
+def test_materialize_strength_rejects_none_and_events_for_is_scoped(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    policy = PolicyVersion(policy_id="p-v1")
+    _cite(ledger, task_id="task-src", labels=["alpha"])
+    _cite(ledger, task_id="task-other", labels=["beta"])
+    _cite(ledger, task_id="task-remote", labels=[])
+
+    with pytest.raises(ValueError, match="visible_strength"):
+        ledger.materialize_strength(REF, T0, policy, None)
+
+    alpha = ledger.events_for(["alpha"])
+    beta = ledger.events_for(["beta"])
+    assert [event.source_channel_labels for event in alpha] == [("alpha",)]
+    assert [event.source_channel_labels for event in beta] == [("beta",)]
+    assert ledger.events_for(["gamma"]) == []
+    assert ledger.events_for([]) == []
+    assert ledger.events_for(["alpha", "beta"]) == alpha + beta
+
+    with pytest.raises(PermissionError, match="offline/admin only"):
+        ledger.events()
+    assert len(ledger.events(require_admin=True)) == 3
+
+
+def test_offline_counts_warn_once(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    citation_ledger_module._OFFLINE_WARNED.clear()
+    ledger = _ledger(tmp_path)
+    _cite(ledger, task_id="task-src", bridge_id="bridge-1")
+    ledger.record_index_level_exposure(
+        task_id="task-src",
+        source_task_id="task-src",
+        ref=REF,
+        source_channel_labels=["chan-a"],
+        policy_version="p-v1",
+    )
+    with caplog.at_level(logging.WARNING):
+        assert ledger.count_index_exposures(REF) == 1
+        assert ledger.count_index_exposures(REF, offline_only=True) == 1
+        assert ledger.bridge_citation_count("bridge-1") == 1
+        assert ledger.bridge_citation_count("bridge-1", offline_only=True) == 1
+    warnings = [record.message for record in caplog.records if record.levelno == logging.WARNING]
+    assert sum("count_index_exposures" in message for message in warnings) == 1
+    assert sum("bridge_citation_count" in message for message in warnings) == 1

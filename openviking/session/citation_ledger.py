@@ -12,6 +12,7 @@ stored for offline recall evaluation and never enters strength.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import uuid
 from collections.abc import Callable, Iterable, Mapping
@@ -19,6 +20,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+_OFFLINE_WARNED: set[str] = set()
 
 LEDGER_FILENAME = "citation-ledger.jsonl"
 
@@ -239,6 +243,23 @@ class CitationEvent:
         )
 
 
+def _warn_offline_once(method: str, *, offline_only: bool) -> None:
+    if method in _OFFLINE_WARNED:
+        return
+    _OFFLINE_WARNED.add(method)
+    logger.warning(
+        "%s is offline-only and is not an online ACL path (offline_only=%s)",
+        method,
+        offline_only,
+    )
+
+
+def _require_principal_labels(labels: Iterable[str]) -> frozenset[str]:
+    if isinstance(labels, (str, bytes)) or not isinstance(labels, Iterable):
+        raise TypeError("principal_labels must be a sequence of strings")
+    return frozenset(_freeze_labels(labels))
+
+
 def _labels_overlap(event_labels: tuple[str, ...], principal_labels: frozenset[str]) -> bool:
     if not event_labels or not principal_labels:
         return False
@@ -353,7 +374,36 @@ class CitationLedger:
         )
         return self._append(event)
 
-    def events(self) -> list[CitationEvent]:
+    def events(self, require_admin: bool = False) -> list[CitationEvent]:
+        """Return every ledger event. Offline/admin only.
+
+        Full reads are not an online path. ``require_admin`` defaults to
+        False and then refuses the full read. Pass ``require_admin=True``
+        for offline or admin inspection. Online callers must use
+        ``events_for``.
+        """
+        if require_admin is not True:
+            raise PermissionError(
+                "events() is offline/admin only; pass require_admin=True "
+                "or use events_for(principal_labels)"
+            )
+        return self._all_events()
+
+    def events_for(self, principal_labels: Iterable[str]) -> list[CitationEvent]:
+        """Return events whose ``source_channel_labels`` intersect ``principal_labels``.
+
+        Events with no labels are not visible to any principal. This is the
+        online read. It does not return a hidden-event count.
+        """
+        allowed = _require_principal_labels(principal_labels)
+        return [
+            event
+            for event in self._all_events()
+            if _labels_overlap(event.source_channel_labels, allowed)
+        ]
+
+    def _all_events(self) -> list[CitationEvent]:
+        """Unfiltered snapshot for load-time state and offline/admin reads."""
         with self._lock:
             return list(self._events)
 
@@ -362,8 +412,13 @@ class CitationLedger:
         ref: CitationRef | Mapping[str, Any],
         as_of: datetime,
         policy: PolicyVersion,
+        principal_labels: Iterable[str] | None,
     ) -> ReferenceStrength:
         """Project dual reference strength at ``as_of`` under ``policy``.
+
+        ``principal_labels`` is required. ``None`` raises ``ValueError`` and
+        points online callers at ``visible_strength``. A citation contributes
+        only when ``source_channel_labels`` intersects ``principal_labels``.
 
         Pure read: events are not modified and the JSONL file is not rewritten.
         Only ``citation`` events for ``ref`` at or before ``as_of`` contribute.
@@ -372,11 +427,20 @@ class CitationLedger:
         Each citation has base weight 1, decayed as ``2^(-age_days/half_life)``.
         A different ``PolicyVersion`` recomputes the projection only.
         """
+        if principal_labels is None:
+            raise ValueError(
+                "principal_labels is required; use visible_strength for online ACL reads"
+            )
+        allowed = _require_principal_labels(principal_labels)
         target = _coerce_ref(ref)
         moment = _as_utc(as_of)
-        with self._lock:
-            snapshot = list(self._events)
-        return _project(snapshot, target, moment, policy, principal_labels=None)
+        return _project(
+            self._all_events(),
+            target,
+            moment,
+            policy,
+            principal_labels=allowed,
+        )
 
     def visible_strength(
         self,
@@ -395,16 +459,28 @@ class CitationLedger:
         target = _coerce_ref(ref)
         allowed = frozenset(_freeze_labels(principal_labels))
         moment = _as_utc(self._clock())
-        with self._lock:
-            snapshot = list(self._events)
-        return _project(snapshot, target, moment, policy, principal_labels=allowed)
+        return _project(
+            self._all_events(),
+            target,
+            moment,
+            policy,
+            principal_labels=allowed,
+        )
 
-    def count_index_exposures(self, ref: CitationRef | Mapping[str, Any]) -> int:
+    def count_index_exposures(
+        self,
+        ref: CitationRef | Mapping[str, Any],
+        *,
+        offline_only: bool = True,
+    ) -> int:
         """Count index-level exposures for ``ref``.
 
-        Offline-only: for recall-quality evaluation. Not an input to online
-        ranking, reference strength, or utility.
+        Offline-only (``offline_only``): for recall-quality evaluation. Not an
+        input to online ranking, reference strength, or utility. The flag does
+        not change the count; it marks this read as offline/admin. Online paths
+        must not call this method.
         """
+        _warn_offline_once("count_index_exposures", offline_only=offline_only)
         target = _coerce_ref(ref)
         with self._lock:
             return sum(
@@ -413,12 +489,15 @@ class CitationLedger:
                 if event.kind == KIND_INDEX_LEVEL_EXPOSURE and event.ref == target
             )
 
-    def bridge_citation_count(self, bridge_id: str) -> int:
+    def bridge_citation_count(self, bridge_id: str, *, offline_only: bool = True) -> int:
         """Count citations that explicitly include ``bridge_id``.
 
-        Citations with no bridge id, and every non-citation event, contribute
-        nothing.
+        Offline-only (``offline_only``): an offline/admin metric, not an online
+        ACL path. The flag does not change the count. Citations with no bridge
+        id, and every non-citation event, contribute nothing. Online paths must
+        not call this method.
         """
+        _warn_offline_once("bridge_citation_count", offline_only=offline_only)
         if not isinstance(bridge_id, str) or bridge_id == "":
             return 0
         with self._lock:

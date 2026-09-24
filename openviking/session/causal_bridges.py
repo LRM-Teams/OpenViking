@@ -11,6 +11,7 @@ judgments. Writes are gated by ``is_causal_mode_enabled``.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import uuid
@@ -22,6 +23,8 @@ from typing import Any, Literal
 
 from openviking.session.causal_experiences import NAMESPACE_DIRNAME
 from openviking_cli.utils.config.memory_config import is_causal_mode_enabled
+
+logger = logging.getLogger(__name__)
 
 BRIDGES_DIRNAME = "bridges"
 EVENTS_FILENAME = "events.jsonl"
@@ -306,6 +309,7 @@ class BridgeRecord:
     evidence_refs: tuple[NodeRef, ...] = ()
     relation_semantics: str | None = None
     counter_example_check: dict[str, Any] | str | None = None
+    security_labels: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "bridge_id", _require_str(self.bridge_id, "bridge_id"))
@@ -342,6 +346,9 @@ class BridgeRecord:
             raise ValueError("counter_example_check must be a dict, str, or None")
         if isinstance(check, dict):
             object.__setattr__(self, "counter_example_check", dict(check))
+        object.__setattr__(
+            self, "security_labels", _security_labels_from(self.security_labels)
+        )
 
     @property
     def status(self) -> BridgeStatus:
@@ -367,6 +374,7 @@ class BridgeRecord:
             "evidence_refs": [ref.to_dict() for ref in self.evidence_refs],
             "relation_semantics": self.relation_semantics,
             "counter_example_check": dict(check) if isinstance(check, dict) else check,
+            "security_labels": list(self.security_labels),
         }
 
     @classmethod
@@ -399,6 +407,7 @@ class BridgeRecord:
             evidence_refs=payload.get("evidence_refs") or [],
             relation_semantics=payload.get("relation_semantics"),
             counter_example_check=payload.get("counter_example_check"),
+            security_labels=payload.get("security_labels") or (),
         )
 
 
@@ -535,6 +544,28 @@ def check_path_budget(
     return violations
 
 
+def _security_labels_from(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError("security_labels must be a list of strings")
+    return tuple(_require_str(item, "security_labels") for item in value)
+
+
+def _principal_labels(labels: Any) -> frozenset[str]:
+    if labels is None:
+        raise ValueError("principal_labels is required")
+    if isinstance(labels, (str, bytes)) or not isinstance(labels, Sequence):
+        raise TypeError("principal_labels must be a sequence of strings")
+    return frozenset(_require_str(item, "principal_labels") for item in labels)
+
+
+def _bridge_visible(bridge: BridgeRecord, principal: frozenset[str]) -> bool:
+    if not bridge.security_labels or not principal:
+        return False
+    return any(label in principal for label in bridge.security_labels)
+
+
 def _is_traversable_status(status: str) -> bool:
     return status in TRAVERSABLE_STATUSES
 
@@ -607,6 +638,7 @@ class CausalBridgeStore:
         self._judgments: dict[str, HypothesisJudgment] = {}
         self._judgments_by_bridge: dict[str, list[str]] = {}
         self._run_counts: dict[str, int] = {}
+        self.skipped_line_count = 0
         self._load()
 
     def _require_causal_write(self) -> None:
@@ -616,7 +648,9 @@ class CausalBridgeStore:
             )
 
     def _load(self) -> None:
+        skipped = 0
         if not self._events_path.is_file():
+            self.skipped_line_count = 0
             return
         with self._events_path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
@@ -625,32 +659,65 @@ class CausalBridgeStore:
                     continue
                 try:
                     event = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        f"corrupt bridge event at line {line_number}"
-                    ) from exc
-                if not isinstance(event, dict):
-                    raise ValueError(f"bridge event at line {line_number} must be an object")
-                self._apply_event(event)
+                    if not isinstance(event, dict):
+                        raise TypeError(
+                            f"bridge event at line {line_number} must be an object"
+                        )
+                    self._apply_event(event)
+                except (json.JSONDecodeError, TypeError, KeyError, ValueError) as exc:
+                    skipped += 1
+                    logger.error(
+                        "skipping corrupt bridge event at line %s: %s",
+                        line_number,
+                        exc,
+                    )
+        self.skipped_line_count = skipped
 
     def _apply_event(self, event: Mapping[str, Any]) -> None:
         event_type = event.get("event_type")
+        if event_type == "judgment_commit":
+            self._apply_judgment_commit(event)
+            return
         if event_type == "judgment":
             judgment = HypothesisJudgment.from_dict(event.get("judgment") or {})
-            if judgment.judgment_id in self._judgments:
-                return
-            self._judgments[judgment.judgment_id] = judgment
-            self._judgments_by_bridge.setdefault(judgment.bridge_id, []).append(
-                judgment.judgment_id
-            )
-            self._run_counts[judgment.run_id] = self._run_counts.get(judgment.run_id, 0) + 1
+            self._remember_judgment(judgment)
             return
         if event_type == "bridge":
             bridge = BridgeRecord.from_dict(event.get("bridge") or {})
-            self._bridges[bridge.bridge_id] = bridge
-            self._by_key[bridge.canonical_key] = bridge.bridge_id
+            self._remember_bridge(bridge)
             return
         raise ValueError(f"unknown bridge event_type {event_type!r}")
+
+    def _remember_bridge(self, bridge: BridgeRecord) -> None:
+        self._bridges[bridge.bridge_id] = bridge
+        self._by_key[bridge.canonical_key] = bridge.bridge_id
+
+    def _remember_judgment(self, judgment: HypothesisJudgment) -> bool:
+        """Record a judgment once. Returns False when ``judgment_id`` was already applied."""
+        if judgment.judgment_id in self._judgments:
+            return False
+        self._judgments[judgment.judgment_id] = judgment
+        self._judgments_by_bridge.setdefault(judgment.bridge_id, []).append(
+            judgment.judgment_id
+        )
+        self._run_counts[judgment.run_id] = self._run_counts.get(judgment.run_id, 0) + 1
+        return True
+
+    def _apply_judgment_commit(self, event: Mapping[str, Any]) -> None:
+        judgment = HypothesisJudgment.from_dict(event.get("judgment") or {})
+        raw_bridges = event.get("bridges")
+        if not isinstance(raw_bridges, list) or not raw_bridges:
+            raise ValueError("judgment_commit requires a non-empty bridges list")
+        bridges = [
+            BridgeRecord.from_dict(item if isinstance(item, dict) else {})
+            for item in raw_bridges
+        ]
+        if not any(bridge.bridge_id == judgment.bridge_id for bridge in bridges):
+            raise ValueError("judgment_commit bridges do not include judgment.bridge_id")
+        if not self._remember_judgment(judgment):
+            return
+        for bridge in bridges:
+            self._remember_bridge(bridge)
 
     def _append_event(self, event: dict[str, Any]) -> None:
         self._events_path.parent.mkdir(parents=True, exist_ok=True)
@@ -689,7 +756,8 @@ class CausalBridgeStore:
         contender: BridgeRecord | None,
         signal: str | None,
         at: str,
-    ) -> BridgeRecord | None:
+    ) -> tuple[BridgeRecord | None, list[BridgeRecord]]:
+        """Plan cap updates against the full bridge set. Does not persist."""
         pool: dict[str, BridgeRecord] = {}
         for bridge in self._bridges.values():
             if bridge.kind != "hypothesis" or bridge.source_ref != source:
@@ -706,6 +774,7 @@ class CausalBridgeStore:
         ranked = sorted(pool.values(), key=self._rank_key)
         keep_ids = {bridge.bridge_id for bridge in ranked[: self._per_node_active_cap]}
         updated = contender
+        pending: list[BridgeRecord] = []
         for bridge in list(pool.values()):
             kept = bridge.bridge_id in keep_ids
             traversable = _is_traversable_status(bridge.status)
@@ -724,10 +793,10 @@ class CausalBridgeStore:
             else:
                 revised = bridge
             if self._bridges.get(revised.bridge_id) != revised:
-                self._persist_bridge(revised)
+                pending.append(revised)
             if updated is not None and revised.bridge_id == updated.bridge_id:
                 updated = revised
-        return updated
+        return updated, pending
 
     def record_judgment(
         self,
@@ -743,6 +812,7 @@ class CausalBridgeStore:
         time_decay: float = 1.0,
         citation_strength: float = 1.0,
         score_fn: ScoreFn | None = None,
+        security_labels: Sequence[str] | None = None,
     ) -> BridgeRecord:
         """Record one judgment, aggregating onto the canonical bridge.
 
@@ -764,6 +834,7 @@ class CausalBridgeStore:
         )
         when = _require_str(timestamp, "timestamp") if timestamp is not None else _utc_now_iso()
         jid = _require_str(judgment_id, "judgment_id") if judgment_id is not None else str(uuid.uuid4())
+        labels = None if security_labels is None else _security_labels_from(security_labels)
         key = canonical_bridge_key(source, target, relation)
 
         with self._lock:
@@ -803,6 +874,7 @@ class CausalBridgeStore:
                     time_decay=decay,
                     citation_strength=citation,
                     governance_score=0.0,
+                    security_labels=labels or (),
                 )
                 was_inactive = False
             else:
@@ -812,6 +884,10 @@ class CausalBridgeStore:
                         "cannot record a hypothesis judgment on an evidence bridge"
                     )
                 bridge = current
+                if labels is not None:
+                    payload = bridge.to_dict()
+                    payload["security_labels"] = list(labels)
+                    bridge = BridgeRecord.from_dict(payload)
                 was_inactive = not _is_traversable_status(current.status)
 
             governance = self._score(direct, decay, citation, score_fn)
@@ -830,13 +906,7 @@ class CausalBridgeStore:
                 run_id=run,
                 bridge_id=bridge.bridge_id,
             )
-            self._judgments[judgment.judgment_id] = judgment
-            self._judgments_by_bridge.setdefault(bridge.bridge_id, []).append(
-                judgment.judgment_id
-            )
-            self._run_counts[run] = self._run_counts.get(run, 0) + 1
-            self._persist_judgment(judgment)
-            updated = self._apply_cap(
+            updated, pending = self._apply_cap(
                 source,
                 contender=bridge,
                 signal="new_judgment" if was_inactive else None,
@@ -844,7 +914,26 @@ class CausalBridgeStore:
             )
             if updated is None:
                 raise ValueError("failed to persist bridge")
-            return updated
+            if all(item.bridge_id != updated.bridge_id for item in pending):
+                pending.append(updated)
+            self._append_event(
+                {
+                    "event_type": "judgment_commit",
+                    "judgment": judgment.to_dict(),
+                    "bridges": [item.to_dict() for item in pending],
+                }
+            )
+            self._apply_event(
+                {
+                    "event_type": "judgment_commit",
+                    "judgment": judgment.to_dict(),
+                    "bridges": [item.to_dict() for item in pending],
+                }
+            )
+            stored = self._bridges.get(updated.bridge_id)
+            if stored is None:
+                raise ValueError("failed to persist bridge")
+            return stored
 
     def reactivate(
         self,
@@ -905,12 +994,15 @@ class CausalBridgeStore:
                 citation_strength=citation,
                 governance_score=governance,
             )
-            updated = self._apply_cap(
+            updated, pending = self._apply_cap(
                 contender.source_ref, contender=contender, signal=signal, at=when
             )
+            for revised in pending:
+                self._persist_bridge(revised)
             if updated is None:
                 raise ValueError(f"unknown bridge_id {bid!r}")
-            return updated
+            stored = self._bridges.get(updated.bridge_id)
+            return stored if stored is not None else updated
 
     def promote_to_evidence(
         self,
@@ -957,13 +1049,23 @@ class CausalBridgeStore:
             self._persist_bridge(promoted)
             return promoted
 
-    def traversable_edges(self, node_ref: NodeRef | Mapping[str, Any]) -> list[BridgeRecord]:
-        """Active and reactivated edges incident to ``node_ref``. Inactive edges are omitted."""
+    def traversable_edges(
+        self,
+        node_ref: NodeRef | Mapping[str, Any],
+        principal_labels: Sequence[str],
+    ) -> list[BridgeRecord]:
+        """Active and reactivated edges incident to ``node_ref`` and visible to ``principal_labels``.
+
+        Bridges with no security labels are invisible to every principal.
+        Inactive edges are omitted. Governance still ranks the full set.
+        """
         node = validate_node_ref(node_ref, "node_ref")
+        principal = _principal_labels(principal_labels)
         edges = [
             bridge
             for bridge in self._bridges.values()
-            if _is_traversable_status(bridge.status)
+            if _bridge_visible(bridge, principal)
+            and _is_traversable_status(bridge.status)
             and (bridge.source_ref == node or bridge.target_ref == node)
         ]
         edges.sort(key=lambda bridge: (bridge.created_at, bridge.bridge_id))
@@ -990,7 +1092,16 @@ class CausalBridgeStore:
         ids = self._judgments_by_bridge.get(bridge_id, [])
         return [self._judgments[judgment_id] for judgment_id in ids]
 
-    def list_bridges(self) -> list[BridgeRecord]:
-        bridges = list(self._bridges.values())
+    def list_bridges(self, principal_labels: Sequence[str]) -> list[BridgeRecord]:
+        """Return bridges whose security labels intersect ``principal_labels``.
+
+        Bridges with no security labels are invisible to every principal.
+        """
+        principal = _principal_labels(principal_labels)
+        bridges = [
+            bridge
+            for bridge in self._bridges.values()
+            if _bridge_visible(bridge, principal)
+        ]
         bridges.sort(key=lambda bridge: (bridge.created_at, bridge.bridge_id))
         return bridges

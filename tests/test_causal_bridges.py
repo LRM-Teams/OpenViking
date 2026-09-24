@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from openviking.session.causal_bridges import (
 
 _CAUSAL_CONFIG = {"skill_trajectory_mode": "causal"}
 _SOURCE = {"type": "fork", "id": "fork-src"}
+_PRINCIPAL = ["team"]
 
 
 def _target(index: int) -> dict[str, str]:
@@ -52,6 +54,7 @@ def _judge(
         timestamp=timestamp or f"2026-09-24T00:00:{index:02d}.000Z",
         judgment_id=judgment_id or f"j-{index}",
         direct_relevance=relevance,
+        security_labels=_PRINCIPAL,
     )
 
 
@@ -94,7 +97,7 @@ def test_run_quota_rejects_thirteenth_write_and_node_cap_inactivates_lowest(
         _judge(quota_store, index=99, run_id="iter-1", relevance=1.0)
     assert raised.value.quota == PER_RUN_WRITE_QUOTA
     assert quota_store.find_bridge(_SOURCE, _target(99), "explores") is None
-    assert len(quota_store.list_bridges()) == PER_RUN_WRITE_QUOTA
+    assert len(quota_store.list_bridges(_PRINCIPAL)) == PER_RUN_WRITE_QUOTA
 
     cap_store = _store(tmp_path / "cap")
     created: list[BridgeRecord] = []
@@ -111,7 +114,7 @@ def test_run_quota_rejects_thirteenth_write_and_node_cap_inactivates_lowest(
     assert lowest is not None
     assert lowest.status == "inactive"
     assert lowest.governance_score == 1.0
-    visible = {bridge.bridge_id for bridge in cap_store.traversable_edges(_SOURCE)}
+    visible = {bridge.bridge_id for bridge in cap_store.traversable_edges(_SOURCE, _PRINCIPAL)}
     assert lowest.bridge_id not in visible
     assert len(visible) == PER_NODE_ACTIVE_CAP
     assert [item.judgment_id for item in cap_store.judgments_for(lowest.bridge_id)] == [
@@ -151,10 +154,10 @@ def test_exposure_cannot_reactivate_but_new_judgment_can_when_capacity_allows(
     )
     assert restored.status == "reactivated"
     assert restored.status_events[-1].signal == "new_judgment"
-    visible = {bridge.bridge_id for bridge in store.traversable_edges(_SOURCE)}
+    visible = {bridge.bridge_id for bridge in store.traversable_edges(_SOURCE, _PRINCIPAL)}
     assert restored.bridge_id in visible
     assert len(visible) == PER_NODE_ACTIVE_CAP
-    displaced = [bridge for bridge in store.list_bridges() if bridge.status == "inactive"]
+    displaced = [bridge for bridge in store.list_bridges(_PRINCIPAL) if bridge.status == "inactive"]
     assert len(displaced) == 1
     assert displaced[0].bridge_id != restored.bridge_id
     assert store.judgments_for(restored.bridge_id)
@@ -262,10 +265,153 @@ def test_persistence_roundtrip_is_lossless(tmp_path: Path) -> None:
     assert reloaded.get_bridge(restored.bridge_id) == restored
     assert reloaded.get_bridge(promoted.bridge_id) == promoted
     assert reloaded.judgments_for(restored.bridge_id) == store.judgments_for(restored.bridge_id)
-    assert [item.to_dict() for item in reloaded.list_bridges()] == [
-        item.to_dict() for item in store.list_bridges()
+    assert [item.to_dict() for item in reloaded.list_bridges(_PRINCIPAL)] == [
+        item.to_dict() for item in store.list_bridges(_PRINCIPAL)
     ]
     assert BridgeRecord.from_dict(restored.to_dict()) == restored
     judgment = store.judgments_for(restored.bridge_id)[0]
     assert HypothesisJudgment.from_dict(judgment.to_dict()) == judgment
-    assert reloaded.traversable_edges(_SOURCE) == store.traversable_edges(_SOURCE)
+    assert reloaded.traversable_edges(_SOURCE, _PRINCIPAL) == store.traversable_edges(_SOURCE, _PRINCIPAL)
+
+
+def _events_path(root: Path) -> Path:
+    return root / "causal-experiences" / "bridges" / "events.jsonl"
+
+
+def test_public_reads_filter_security_labels_and_hide_unlabeled(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    alpha = store.record_judgment(
+        run_id="run-a",
+        source_ref=_SOURCE,
+        target_ref=_target(1),
+        relation_type="explores",
+        relevance=1.0,
+        timestamp="2026-09-24T00:00:01.000Z",
+        judgment_id="j-alpha",
+        direct_relevance=1.0,
+        security_labels=["alpha"],
+    )
+    beta = store.record_judgment(
+        run_id="run-b",
+        source_ref=_SOURCE,
+        target_ref=_target(2),
+        relation_type="explores",
+        relevance=1.0,
+        timestamp="2026-09-24T00:00:02.000Z",
+        judgment_id="j-beta",
+        direct_relevance=1.0,
+        security_labels=["beta", "shared"],
+    )
+    unlabeled = store.record_judgment(
+        run_id="run-c",
+        source_ref=_SOURCE,
+        target_ref=_target(3),
+        relation_type="explores",
+        relevance=1.0,
+        timestamp="2026-09-24T00:00:03.000Z",
+        judgment_id="j-plain",
+        direct_relevance=1.0,
+    )
+
+    assert [item.bridge_id for item in store.list_bridges(["alpha"])] == [alpha.bridge_id]
+    assert [item.bridge_id for item in store.list_bridges(["beta"])] == [beta.bridge_id]
+    assert [item.bridge_id for item in store.list_bridges(["shared"])] == [beta.bridge_id]
+    assert store.list_bridges([]) == []
+    visible_ids = {item.bridge_id for item in store.list_bridges(["alpha", "beta", "other"])}
+    assert visible_ids == {alpha.bridge_id, beta.bridge_id}
+    assert unlabeled.bridge_id not in visible_ids
+    for principal in (["alpha"], ["beta"], ["shared"], ["other"], []):
+        listed = {item.bridge_id for item in store.list_bridges(principal)}
+        edges = {item.bridge_id for item in store.traversable_edges(_SOURCE, principal)}
+        assert unlabeled.bridge_id not in listed
+        assert unlabeled.bridge_id not in edges
+    assert {item.bridge_id for item in store.traversable_edges(_SOURCE, ["alpha"])} == {
+        alpha.bridge_id
+    }
+    assert store.get_bridge(unlabeled.bridge_id) == unlabeled
+
+
+def test_judgment_replay_is_idempotent_and_applies_once(tmp_path: Path) -> None:
+    root = tmp_path / "idem"
+    store = _store(root, per_node_active_cap=1)
+    first = _judge(store, index=1, run_id="run-1", relevance=1.0, judgment_id="j-once")
+    rival = _judge(store, index=2, run_id="run-2", relevance=9.0, judgment_id="j-rival")
+    dormant = store.get_bridge(first.bridge_id)
+    assert dormant is not None and dormant.status == "inactive"
+    assert rival.status == "active"
+    before = dormant.to_dict()
+    path = _events_path(root)
+    before_text = path.read_text(encoding="utf-8")
+    assert before_text.count('"event_type": "judgment_commit"') == 2
+
+    again = store.record_judgment(
+        run_id="run-1",
+        source_ref=_SOURCE,
+        target_ref=_target(1),
+        relation_type="explores",
+        relevance=1.0,
+        timestamp="2026-09-24T00:00:01.000Z",
+        judgment_id="j-once",
+        direct_relevance=1.0,
+        security_labels=_PRINCIPAL,
+    )
+    assert again.to_dict() == before
+    assert path.read_text(encoding="utf-8") == before_text
+    assert [item.judgment_id for item in store.judgments_for(first.bridge_id)] == ["j-once"]
+    assert len(store.get_bridge(first.bridge_id).status_events) == len(dormant.status_events)  # type: ignore[union-attr]
+
+    path.write_text(before_text + before_text.splitlines()[0] + "\n", encoding="utf-8")
+    reloaded = _store(root, per_node_active_cap=1)
+    restored = reloaded.get_bridge(first.bridge_id)
+    assert restored is not None
+    assert restored.to_dict() == before
+    assert [item.judgment_id for item in reloaded.judgments_for(first.bridge_id)] == ["j-once"]
+    replay = reloaded.record_judgment(
+        run_id="run-1",
+        source_ref=_SOURCE,
+        target_ref=_target(1),
+        relation_type="explores",
+        relevance=1.0,
+        timestamp="2026-09-24T00:00:01.000Z",
+        judgment_id="j-once",
+        direct_relevance=1.0,
+    )
+    assert replay.to_dict() == before
+    assert _events_path(root).read_text(encoding="utf-8") == path.read_text(encoding="utf-8")
+
+    for index in range(1, PER_RUN_WRITE_QUOTA):
+        _judge(
+            reloaded,
+            index=index + 20,
+            run_id="run-1",
+            relevance=1.0,
+            judgment_id=f"extra-{index}",
+        )
+    with pytest.raises(QuotaExceeded):
+        _judge(reloaded, index=90, run_id="run-1", relevance=1.0, judgment_id="extra-overflow")
+
+
+def test_corrupt_jsonl_line_is_skipped_and_store_stays_usable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    root = tmp_path / "corrupt"
+    store = _store(root)
+    first = _judge(store, index=1, run_id="run-1", relevance=2.0, judgment_id="j-good-1")
+    second = _judge(store, index=2, run_id="run-2", relevance=3.0, judgment_id="j-good-2")
+    path = _events_path(root)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    path.write_text(
+        lines[0] + "\n{not-json\n[]\n" + lines[1] + "\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.ERROR):
+        reloaded = _store(root)
+    assert reloaded.skipped_line_count == 2
+    assert reloaded.get_bridge(first.bridge_id) == first
+    assert reloaded.get_bridge(second.bridge_id) == second
+    assert reloaded.judgments_for(first.bridge_id) == store.judgments_for(first.bridge_id)
+    assert reloaded.judgments_for(second.bridge_id) == store.judgments_for(second.bridge_id)
+    assert any("skipping corrupt bridge event" in record.message for record in caplog.records)
+    third = _judge(reloaded, index=3, run_id="run-3", relevance=4.0, judgment_id="j-good-3")
+    assert reloaded.get_bridge(third.bridge_id) == third
+    assert len(reloaded.list_bridges(_PRINCIPAL)) == 3
