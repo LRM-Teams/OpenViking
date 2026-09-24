@@ -19,14 +19,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+
+logger = logging.getLogger(__name__)
 
 from openviking_cli.utils.config.memory_config import is_causal_mode_enabled
 
@@ -79,6 +82,10 @@ PositionKind = Literal["block", "edge", "cut"]
 
 INDEPENDENT_CONTROL_REF_KIND = "independent_control"
 OBSERVED_BRANCH_EVIDENCE_STATUS = "real"
+
+
+class InterventionIndexCorruptError(RuntimeError):
+    """Intervention-history index could not be read and was not treated as empty."""
 
 
 class ForkStatus:
@@ -791,6 +798,31 @@ def _provisional_idempotency_key(revision: ForkNodeRevision) -> str:
     )
 
 
+def _normalize_principal_labels(labels: Any) -> frozenset[str]:
+    if isinstance(labels, (str, bytes)) or not isinstance(labels, Sequence):
+        raise ValueError("principal_labels must be a sequence of str")
+    return frozenset(_require_str(item, "principal_labels") for item in labels)
+
+
+def _security_labels_of(row: dict[str, Any]) -> frozenset[str]:
+    raw = row.get("security_labels")
+    if not isinstance(raw, list) or not raw:
+        return frozenset()
+    labels: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item:
+            return frozenset()
+        labels.append(item)
+    return frozenset(labels)
+
+
+def _quarantine_intervention_index(path: Path) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    dest = path.with_name(f"{path.name}.corrupt-{stamp}")
+    os.replace(path, dest)
+    return dest
+
+
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -926,18 +958,31 @@ class CausalExperiencesStore:
             return set()
         return {path.stem for path in rev_dir.glob("*.json") if path.is_file()}
 
-    def upsert_fork_node(self, payload: dict[str, Any], *, idempotency_key: str) -> dict[str, Any]:
+    def upsert_fork_node(
+        self,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str,
+        _allow_terminal_status: bool = False,
+    ) -> dict[str, Any]:
         """Validate and persist a fork-node revision (Q26 server-side minimum).
 
         Evaluator / orchestration is not triggered here; that is a later slice.
+        ``validated`` / ``invalidated`` are accepted only from the append APIs.
         """
         self._require_causal_write()
         if not isinstance(payload, dict):
             raise ValueError("payload must be a dict")
         if not isinstance(idempotency_key, str) or not idempotency_key:
             raise ValueError("idempotency_key must be a non-empty str")
-        if payload.get("status") == ForkStatus.DRAFT:
+        status = payload.get("status")
+        if status == ForkStatus.DRAFT:
             raise ValueError("draft status cannot be written to authoritative storage")
+        if status in (ForkStatus.VALIDATED, ForkStatus.INVALIDATED) and not _allow_terminal_status:
+            raise ValueError(
+                f"status {status!r} cannot be written by upsert_fork_node; "
+                "only append_validated/append_invalidated may write validated|invalidated"
+            )
 
         incoming = dict(payload)
         payload_hash = _sha256_text(_canonical_dumps(incoming))
@@ -992,10 +1037,6 @@ class CausalExperiencesStore:
 
             revision_id = incoming.get("revision_id") or str(uuid.uuid4())
             revision_id = _require_str(revision_id, "revision_id")
-            if revision_id in self._revision_ids_on_disk(fork_node_id):
-                raise ValueError(
-                    f"duplicate revision_id {revision_id!r} under fork_node_id {fork_node_id}"
-                )
 
             created_at = incoming.get("created_at") or _utc_now_iso()
             draft = dict(incoming)
@@ -1005,6 +1046,14 @@ class CausalExperiencesStore:
             draft["anchor"] = anchor
             draft["content_hash"] = ""
             revision = ForkNodeRevision.from_dict(draft)
+
+            if revision.revision_id in self._revision_ids_on_disk(fork_node_id):
+                return self._recover_missing_idempotency(
+                    fork_node_id=fork_node_id,
+                    revision=revision,
+                    idem_path=idem_path,
+                    payload_hash=payload_hash,
+                )
 
             revision_path = self._revision_path(fork_node_id, revision.revision_id)
             _atomic_write_json(revision_path, revision.to_dict())
@@ -1035,6 +1084,48 @@ class CausalExperiencesStore:
                 },
             )
             return result
+
+    def _recover_missing_idempotency(
+        self,
+        *,
+        fork_node_id: str,
+        revision: ForkNodeRevision,
+        idem_path: Path,
+        payload_hash: str,
+    ) -> dict[str, Any]:
+        """Finish a crash window where the revision is durable and idempotency is not.
+
+        Matching content is an idempotent hit: rewrite the idempotency file and
+        return the original identity. Differing content is a conflict. This path
+        never reports ``duplicate revision_id``.
+        """
+        path = self._revision_path(fork_node_id, revision.revision_id)
+        stored = ForkNodeRevision.from_dict(
+            json.loads(path.read_text(encoding="utf-8"))
+        )
+        if stored.content_hash != revision.content_hash:
+            raise ValueError(
+                "idempotency key conflict: revision already stored with different content "
+                f"for revision_id {revision.revision_id!r}"
+            )
+        result = {
+            "fork_node_id": stored.fork_node_id,
+            "revision_id": stored.revision_id,
+            "deduplicated": True,
+            "created": False,
+        }
+        _atomic_write_json(
+            idem_path,
+            {
+                "payload_hash": payload_hash,
+                "content_hash": stored.content_hash,
+                "fork_node_id": stored.fork_node_id,
+                "revision_id": stored.revision_id,
+                "created": False,
+                "result": result,
+            },
+        )
+        return result
 
     def get_fork_node(self, fork_node_id: str) -> dict[str, Any] | None:
         rev_dir = self._revisions_dir(fork_node_id)
@@ -1151,11 +1242,19 @@ class CausalExperiencesStore:
         )
 
     def query_intervention_history(
-        self, view_revision_id: str, position_key: str
+        self,
+        view_revision_id: str,
+        position_key: str,
+        principal_labels: Sequence[str],
     ) -> list[dict[str, Any]]:
-        """Return intervention-history rows for one grounded position."""
+        """Return intervention-history rows visible to ``principal_labels``.
+
+        Each row is kept only when its security labels intersect the principal.
+        Rows with missing labels are omitted. The result has no hidden-count fields.
+        """
         view_revision_id = _require_str(view_revision_id, "view_revision_id")
         position_key = _require_str(position_key, "position_key")
+        principal = _normalize_principal_labels(principal_labels)
         with self._lock:
             rows = self._read_intervention_entries()
         matched = [
@@ -1163,6 +1262,7 @@ class CausalExperiencesStore:
             for row in rows
             if row.get("view_revision_id") == view_revision_id
             and row.get("position_key") == position_key
+            and principal.intersection(_security_labels_of(row))
         ]
         return matched
 
@@ -1225,6 +1325,7 @@ class CausalExperiencesStore:
                     "content_hash": revision.content_hash,
                 }
             ),
+            _allow_terminal_status=True,
         )
         stored = self.get_revision(result["fork_node_id"], result["revision_id"])
         if stored is None:
@@ -1245,6 +1346,7 @@ class CausalExperiencesStore:
             "validation_status": revision.status,
             "summary": grounding.semantic_summary_snapshot,
             "needs_revalidation": False,
+            "security_labels": [revision.workspace_id],
         }
         with self._lock:
             rows = self._read_intervention_entries()
@@ -1255,18 +1357,39 @@ class CausalExperiencesStore:
 
     def _read_intervention_entries(self) -> list[dict[str, Any]]:
         path = self._intervention_index_path
-        if not path.is_file():
+        if not path.exists():
             return []
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return []
-        if not isinstance(payload, dict):
-            return []
-        entries = payload.get("entries")
-        if not isinstance(entries, list):
-            return []
-        return [dict(item) for item in entries if isinstance(item, dict)]
+        except (OSError, json.JSONDecodeError) as exc:
+            self._raise_corrupt_intervention_index(path, exc)
+        if not isinstance(payload, dict) or not isinstance(payload.get("entries"), list):
+            self._raise_corrupt_intervention_index(
+                path, ValueError("intervention index entries are missing")
+            )
+        entries = payload["entries"]
+        if any(not isinstance(item, dict) for item in entries):
+            self._raise_corrupt_intervention_index(
+                path, ValueError("intervention index entry is not an object")
+            )
+        return [dict(item) for item in entries]
+
+    def _raise_corrupt_intervention_index(self, path: Path, exc: BaseException) -> None:
+        try:
+            quarantined = _quarantine_intervention_index(path)
+        except OSError:
+            logger.error("intervention index unreadable and could not be quarantined: %s", path)
+            raise InterventionIndexCorruptError(
+                f"intervention index corrupt at {path}; quarantine failed"
+            ) from exc
+        logger.error(
+            "intervention index unreadable at %s; quarantined to %s",
+            path,
+            quarantined,
+        )
+        raise InterventionIndexCorruptError(
+            f"intervention index corrupt; quarantined to {quarantined}"
+        ) from exc
 
     def _write_intervention_entries(self, rows: list[dict[str, Any]]) -> None:
         _atomic_write_json(self._intervention_index_path, {"entries": rows})

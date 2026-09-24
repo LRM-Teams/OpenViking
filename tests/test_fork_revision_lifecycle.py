@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 
 import pytest
 
@@ -14,10 +15,13 @@ from openviking.session.causal_experiences import (
     CausalExperiencesStore,
     ForkStatus,
     InfluenceGrounding,
+    InterventionIndexCorruptError,
     ServerChecks,
     influence_position_key,
 )
-from tests.test_causal_experiences import _ao_anchor, _payload, _store
+from tests.test_causal_experiences import _ao_anchor, _payload, _seven_sections, _store
+
+_PRINCIPAL = ["ws-1"]
 
 _PASSING_CHECKS = ServerChecks(
     anchor_exists=True,
@@ -183,7 +187,9 @@ def test_grounding_snapshot_reverse_index_and_revalidation(tmp_path) -> None:
     )
 
     position_key = influence_position_key(grounding)
-    history = store.query_intervention_history(grounding.view_revision_id, position_key)
+    history = store.query_intervention_history(
+        grounding.view_revision_id, position_key, _PRINCIPAL
+    )
     assert [row["fork_node_id"] for row in history] == [provisional.fork_node_id]
     assert history[0]["revision_id"] == provisional.revision_id
     assert history[0]["validation_status"] == ForkStatus.PROVISIONAL
@@ -191,7 +197,9 @@ def test_grounding_snapshot_reverse_index_and_revalidation(tmp_path) -> None:
     assert history[0]["needs_revalidation"] is False
 
     validated = store.append_validated(provisional.fork_node_id, _validated_evidence())
-    history = store.query_intervention_history(grounding.view_revision_id, position_key)
+    history = store.query_intervention_history(
+        grounding.view_revision_id, position_key, _PRINCIPAL
+    )
     assert [row["revision_id"] for row in history] == [
         provisional.revision_id,
         validated.revision_id,
@@ -210,11 +218,13 @@ def test_grounding_snapshot_reverse_index_and_revalidation(tmp_path) -> None:
     flagged = store.mark_needs_revalidation(grounding.view_revision_id)
     assert flagged == 2
     assert revision_path.read_bytes() == before
-    history = store.query_intervention_history(grounding.view_revision_id, position_key)
+    history = store.query_intervention_history(
+        grounding.view_revision_id, position_key, _PRINCIPAL
+    )
     assert len(history) == 2
     assert all(row["needs_revalidation"] is True for row in history)
     other_history = store.query_intervention_history(
-        other.view_revision_id, influence_position_key(other)
+        other.view_revision_id, influence_position_key(other), _PRINCIPAL
     )
     assert len(other_history) == 1
     assert other_history[0]["needs_revalidation"] is False
@@ -246,3 +256,114 @@ def test_no_public_api_changes_status_from_citation_counts() -> None:
     assert "append_validated" in store_methods
     assert "append_invalidated" in store_methods
     assert not any("citation" in name.lower() for name in store_methods)
+
+
+def test_retry_recovers_when_revision_exists_without_idempotency_file(tmp_path) -> None:
+    store = _store(tmp_path)
+    payload = _payload()
+    key = "crash-window"
+    first = store.upsert_fork_node(payload, idempotency_key=key)
+    ns = tmp_path / "causal-experiences"
+    idem_files = list((ns / ".idempotency").glob("*.json"))
+    assert len(idem_files) == 1
+    idem_files[0].unlink()
+    index_before = (ns / "index.jsonl").read_text(encoding="utf-8")
+
+    replay = store.upsert_fork_node(payload, idempotency_key=key)
+    assert replay["fork_node_id"] == first["fork_node_id"]
+    assert replay["revision_id"] == first["revision_id"]
+    assert replay["deduplicated"] is True
+    assert replay["created"] is False
+    assert (ns / "index.jsonl").read_text(encoding="utf-8") == index_before
+    assert list((ns / ".idempotency").glob("*.json"))
+
+    for path in (ns / ".idempotency").glob("*.json"):
+        path.unlink()
+    changed = _payload(seven_sections=_seven_sections(session_title="rewritten session title"))
+    with pytest.raises(ValueError, match="idempotency key conflict") as caught:
+        store.upsert_fork_node(changed, idempotency_key=key)
+    assert "duplicate revision_id" not in str(caught.value)
+    stored = store.get_revision(first["fork_node_id"], first["revision_id"])
+    assert stored is not None
+    assert stored["seven_sections"]["session_title"] == payload["seven_sections"]["session_title"]
+
+
+def test_corrupt_intervention_index_is_quarantined_and_history_survives_repair(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    grounding = _grounding()
+    provisional = store.commit_provisional(
+        store.submit_fork_draft(_payload(), influence_grounding=grounding),
+        _PASSING_CHECKS,
+    )
+    index = tmp_path / "causal-experiences" / "intervention-index.json"
+    good = index.read_bytes()
+    index.write_text("{not-json", encoding="utf-8")
+
+    with pytest.raises(InterventionIndexCorruptError):
+        store.mark_needs_revalidation(grounding.view_revision_id)
+    assert not index.exists()
+    quarantined = list(index.parent.glob("intervention-index.json.corrupt-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == "{not-json"
+
+    index.write_bytes(good)
+    history = store.query_intervention_history(
+        grounding.view_revision_id, influence_position_key(grounding), _PRINCIPAL
+    )
+    assert [row["revision_id"] for row in history] == [provisional.revision_id]
+    assert history[0]["needs_revalidation"] is False
+
+
+def test_intervention_history_hides_rows_the_principal_cannot_see(tmp_path) -> None:
+    store = _store(tmp_path)
+    grounding = _grounding()
+    provisional = store.commit_provisional(
+        store.submit_fork_draft(_payload(), influence_grounding=grounding),
+        _PASSING_CHECKS,
+    )
+    position_key = influence_position_key(grounding)
+    hidden = store.query_intervention_history(
+        grounding.view_revision_id, position_key, ["outsider"]
+    )
+    assert hidden == []
+
+    visible = store.query_intervention_history(
+        grounding.view_revision_id, position_key, _PRINCIPAL
+    )
+    assert [row["revision_id"] for row in visible] == [provisional.revision_id]
+    assert set(visible[0]) == {
+        "fork_node_id",
+        "revision_id",
+        "validation_status",
+        "summary",
+        "needs_revalidation",
+    }
+
+    index = tmp_path / "causal-experiences" / "intervention-index.json"
+    payload = json.loads(index.read_text(encoding="utf-8"))
+    del payload["entries"][0]["security_labels"]
+    index.write_text(json.dumps(payload), encoding="utf-8")
+    unlabeled = store.query_intervention_history(
+        grounding.view_revision_id, position_key, _PRINCIPAL
+    )
+    assert unlabeled == []
+
+
+def test_upsert_rejects_direct_validated_and_invalidated_status(tmp_path) -> None:
+    store = _store(tmp_path)
+    with pytest.raises(ValueError, match="append_validated/append_invalidated"):
+        store.upsert_fork_node(_payload(status=ForkStatus.VALIDATED), idempotency_key="direct-v")
+    with pytest.raises(ValueError, match="append_validated/append_invalidated"):
+        store.upsert_fork_node(
+            _payload(status=ForkStatus.INVALIDATED), idempotency_key="direct-i"
+        )
+    assert store.get_fork_node(_payload()["fork_node_id"]) is None
+
+    accepted = store.upsert_fork_node(
+        _payload(status=ForkStatus.PROVISIONAL), idempotency_key="direct-p"
+    )
+    stored = store.get_revision(accepted["fork_node_id"], accepted["revision_id"])
+    assert stored is not None
+    assert stored["status"] == ForkStatus.PROVISIONAL
