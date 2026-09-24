@@ -87,6 +87,7 @@ def _service(
     clock=None,
     name: str = "queue.json",
     projection_registry=None,
+    revalidation_callback=None,
 ):
     index = ViewSupersedeIndex(tmp_path / f"{name}.views.json")
     service = TrajectoryIndexService(
@@ -95,6 +96,7 @@ def _service(
         builder=builder,
         clock=clock,
         projection_registry=projection_registry,
+        revalidation_callback=revalidation_callback,
     )
     return service, index
 
@@ -402,6 +404,74 @@ def test_lower_priority_job_stays_deferred_until_flush(tmp_path) -> None:
         "rev-run-high",
         "rev-run-low",
     ]
+
+
+def test_supersede_calls_revalidation_callback_with_previous_revision(tmp_path) -> None:
+    seen: list[str] = []
+    service, _index = _service(
+        tmp_path,
+        builder=_revision_for,
+        revalidation_callback=seen.append,
+    )
+    policy = WorkspacePolicy(max_builds_per_window=5, window_seconds=60)
+    service.enqueue(
+        _job("job-1", "sess", priority=PRIORITY_SUCCEEDED, outcome_status="succeeded", task_run_id="run-1")
+    )
+    first = service.process_next(policy)
+    assert isinstance(first, IndexedResult)
+    assert seen == []
+    service.enqueue(
+        _job(
+            "job-2",
+            "sess",
+            priority=PRIORITY_SUCCEEDED,
+            outcome_status="succeeded",
+            task_run_id="run-2",
+            enqueued_at=T1,
+        )
+    )
+    second = service.process_next(policy)
+    assert isinstance(second, IndexedResult)
+    assert seen == [first.revision.revision_id]
+
+
+def test_supersede_without_revalidation_callback_warns_once(tmp_path, caplog) -> None:
+    service, _index = _service(tmp_path, builder=_revision_for)
+    policy = WorkspacePolicy(max_builds_per_window=5, window_seconds=60)
+    service.enqueue(
+        _job("job-1", "sess", priority=PRIORITY_SUCCEEDED, outcome_status="succeeded", task_run_id="run-1")
+    )
+    service.process_next(policy)
+    with caplog.at_level(logging.WARNING):
+        service.enqueue(
+            _job(
+                "job-2",
+                "sess",
+                priority=PRIORITY_SUCCEEDED,
+                outcome_status="succeeded",
+                task_run_id="run-2",
+                enqueued_at=T1,
+            )
+        )
+        service.process_next(policy)
+        service.enqueue(
+            _job(
+                "job-3",
+                "sess",
+                priority=PRIORITY_SUCCEEDED,
+                outcome_status="succeeded",
+                task_run_id="run-3",
+                enqueued_at=T2,
+            )
+        )
+        service.process_next(policy)
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "openviking.session.trajectory_index" and "revalidation_callback" in record.message
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
 
 
 def test_process_next_empty_queue_raises(tmp_path) -> None:

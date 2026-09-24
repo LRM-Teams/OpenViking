@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -19,7 +20,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from openviking.session.influence_view import InfluenceViewRevision
+from openviking.session.influence_view import CONSTRUCTION_MODE_FALLBACK, InfluenceViewRevision
+
+logger = logging.getLogger(__name__)
 
 REGISTRY_VERSION = 1
 
@@ -38,9 +41,12 @@ REMOVAL_REASONS = frozenset((REMOVAL_ACL_CHANGE, REMOVAL_SUPERSEDED))
 CardKind = Literal["block", "claim"]
 CardStatus = Literal["provisional", "verified"]
 RemovalReason = Literal["acl_change", "superseded"]
-GroundingQuery = Callable[[str, str], bool]
+GroundingQuery = Callable[[str, str], Mapping[str, Any] | None]
+RevalidationCallback = Callable[[str], None]
 SessionAcl = Callable[[str], Sequence[str]]
 Clock = Callable[[], datetime]
+
+FORK_STATUS_VALIDATED = "validated"
 
 
 def _utc_now() -> datetime:
@@ -349,16 +355,20 @@ class ProjectionRegistry:
         grounding_query: GroundingQuery | None = None,
         session_acl: SessionAcl | None = None,
         clock: Clock | None = None,
+        revalidation_callback: RevalidationCallback | None = None,
     ) -> None:
         self.path = Path(path)
         self._grounding_query = grounding_query
         self._session_acl = session_acl
         self._clock = clock or _utc_now
+        self._revalidation_callback = revalidation_callback
         self._lock = threading.RLock()
         self._entries: dict[str, _ActiveEntry] = {}
         self._removed: list[RemovalRecord] = []
-        self._validated: set[tuple[str, str]] = set()
+        self._validated: dict[tuple[str, str], dict[str, str] | None] = {}
+        self._construction_modes: dict[str, str] = {}
         self._removal_seq = 0
+        self._warned_missing_revalidation = False
         self._load()
 
     def register(
@@ -366,7 +376,7 @@ class ProjectionRegistry:
         revision: InfluenceViewRevision,
         *,
         acl_labels: Sequence[str] | None = None,
-        validated_positions: Sequence[str] | None = None,
+        validated_positions: Sequence[Any] | None = None,
     ) -> tuple[InfluenceProjection, ...]:
         """Project every block and claim on a frozen revision.
 
@@ -376,6 +386,7 @@ class ProjectionRegistry:
         if not isinstance(revision, InfluenceViewRevision):
             raise ValueError("revision must be a frozen InfluenceViewRevision")
         with self._lock:
+            self._construction_modes[revision.revision_id] = revision.construction_mode
             self._remember_validated(revision.revision_id, validated_positions)
             existing = self._cards_for_revision_locked(revision.revision_id)
             if existing:
@@ -420,16 +431,20 @@ class ProjectionRegistry:
         block_or_claim_id: str,
         fork_provenance: Mapping[str, Any],
     ) -> InfluenceProjection:
-        """Move one card to the verified channel when grounding is validated."""
+        """Move one card to the verified channel when grounding is validated.
+
+        ``grounding_query`` must return the authoritative ForkRevision record
+        ``{fork_node_id, revision_id, status, position_match}`` or ``None``.
+        Promotion requires ``status == validated`` and ``position_match``.
+        Static ``validated_positions`` remain a compatibility path only when
+        they carry ``fork_provenance`` (``fork_node_id`` and ``revision_id``).
+        Fallback views are never promoted (ADR #72).
+        """
         revision_id = _require_str(view_revision_id, "view_revision_id")
         position_id = _require_str(block_or_claim_id, "block_or_claim_id")
         provenance = _copy_json_dict(dict(fork_provenance), "fork_provenance", allow_empty=False)
         with self._lock:
-            if not self._is_validated_locked(revision_id, position_id):
-                raise ValueError(
-                    "cannot promote without validated ForkRevision grounding "
-                    f"for {revision_id}:{position_id}"
-                )
+            self._require_promotable_locked(revision_id, position_id, provenance)
             entry = self._find_locked(revision_id, position_id)
             if entry is None:
                 raise ValueError(
@@ -474,6 +489,7 @@ class ProjectionRegistry:
             )
             if removed:
                 self._save_locked()
+                self._notify_revalidation_locked(session)
             return removed
 
     def withdraw_superseded(
@@ -509,6 +525,7 @@ class ProjectionRegistry:
             )
             if removed:
                 self._save_locked()
+                self._notify_withdrawn_revisions_locked(removed)
             return removed
 
     def removed_records(self) -> tuple[RemovalRecord, ...]:
@@ -521,15 +538,26 @@ class ProjectionRegistry:
                 self._entries[card_id].to_dict()
                 for card_id in sorted(self._entries)
             ]
-            positions = [
-                {"view_revision_id": revision_id, "block_or_claim_id": position_id}
-                for revision_id, position_id in sorted(self._validated)
-            ]
+            positions = []
+            for revision_id, position_id in sorted(self._validated):
+                row: dict[str, Any] = {
+                    "view_revision_id": revision_id,
+                    "block_or_claim_id": position_id,
+                }
+                provenance = self._validated[(revision_id, position_id)]
+                if provenance:
+                    row["fork_node_id"] = provenance["fork_node_id"]
+                    row["revision_id"] = provenance["revision_id"]
+                positions.append(row)
             return {
                 "version": REGISTRY_VERSION,
                 "entries": entries,
                 "removed": [record.to_dict() for record in self._removed],
                 "validated_positions": positions,
+                "construction_modes": {
+                    revision_id: self._construction_modes[revision_id]
+                    for revision_id in sorted(self._construction_modes)
+                },
                 "removal_seq": self._removal_seq,
             }
 
@@ -542,12 +570,14 @@ class ProjectionRegistry:
         grounding_query: GroundingQuery | None = None,
         session_acl: SessionAcl | None = None,
         clock: Clock | None = None,
+        revalidation_callback: RevalidationCallback | None = None,
     ) -> ProjectionRegistry:
         registry = cls(
             path,
             grounding_query=grounding_query,
             session_acl=session_acl,
             clock=clock,
+            revalidation_callback=revalidation_callback,
         )
         registry._apply(data, persist=True)
         return registry
@@ -562,14 +592,25 @@ class ProjectionRegistry:
     def _remember_validated(
         self,
         view_revision_id: str,
-        validated_positions: Sequence[str] | None,
+        validated_positions: Sequence[Any] | None,
     ) -> None:
         if not validated_positions:
             return
         if isinstance(validated_positions, (str, bytes)):
-            raise ValueError("validated_positions must be a sequence of str")
-        for position_id in validated_positions:
-            self._validated.add((view_revision_id, _require_str(position_id, "validated_positions")))
+            raise ValueError("validated_positions must be a sequence of str or mapping")
+        for item in validated_positions:
+            if isinstance(item, str):
+                position_id = _require_str(item, "validated_positions")
+                self._validated.setdefault((view_revision_id, position_id), None)
+                continue
+            if isinstance(item, Mapping):
+                position_raw = item.get("block_or_claim_id", item.get("position_id"))
+                position_id = _require_str(position_raw, "validated_positions")
+                nested = item.get("fork_provenance")
+                source = nested if isinstance(nested, Mapping) else item
+                self._validated[(view_revision_id, position_id)] = _provenance_record(source)
+                continue
+            raise ValueError("validated_positions entries must be str or mapping")
 
     def _cards_for_revision_locked(self, view_revision_id: str) -> tuple[InfluenceProjection, ...]:
         cards = [
@@ -593,8 +634,11 @@ class ProjectionRegistry:
             and entry.card.source_pointer.view_revision_id != revision.revision_id
         ]
         doomed.sort(key=lambda entry: entry.card.card_id)
-        for entry in doomed:
+        removed = [
             self._withdraw_locked(entry, reason=REMOVAL_SUPERSEDED, new_labels=new_labels)
+            for entry in doomed
+        ]
+        self._notify_withdrawn_revisions_locked(removed)
 
     def _withdraw_locked(
         self,
@@ -616,12 +660,68 @@ class ProjectionRegistry:
         self._removed.append(record)
         return record
 
-    def _is_validated_locked(self, view_revision_id: str, block_or_claim_id: str) -> bool:
-        if (view_revision_id, block_or_claim_id) in self._validated:
-            return True
-        if self._grounding_query is None:
-            return False
-        return bool(self._grounding_query(view_revision_id, block_or_claim_id))
+    def _require_promotable_locked(
+        self,
+        view_revision_id: str,
+        block_or_claim_id: str,
+        provenance: Mapping[str, Any],
+    ) -> None:
+        if self._construction_modes.get(view_revision_id) == CONSTRUCTION_MODE_FALLBACK:
+            raise ValueError(
+                "cannot promote fallback view projection to verified; "
+                "ADR #72: fallback construction cannot by itself satisfy validated "
+                f"ForkRevision grounding for {view_revision_id}:{block_or_claim_id}"
+            )
+        if self._grounding_query is not None:
+            reason = _authoritative_grounding_reason(
+                self._grounding_query(view_revision_id, block_or_claim_id),
+                view_revision_id,
+                block_or_claim_id,
+            )
+        else:
+            reason = self._static_grounding_reason(view_revision_id, block_or_claim_id, provenance)
+        if reason:
+            raise ValueError(reason)
+
+    def _static_grounding_reason(
+        self,
+        view_revision_id: str,
+        block_or_claim_id: str,
+        provenance: Mapping[str, Any],
+    ) -> str | None:
+        key = (view_revision_id, block_or_claim_id)
+        label = f"{view_revision_id}:{block_or_claim_id}"
+        if key not in self._validated:
+            return f"cannot promote without validated ForkRevision grounding for {label}"
+        stored = self._validated[key]
+        if _fork_identity(provenance) or _fork_identity(stored):
+            return None
+        return (
+            "cannot promote from static validated_positions without fork_provenance "
+            f"(fork_node_id and revision_id) for {label}"
+        )
+
+    def _notify_withdrawn_revisions_locked(self, removed: Sequence[RemovalRecord]) -> None:
+        seen: list[str] = []
+        for record in removed:
+            view_revision_id = record.card.source_pointer.view_revision_id
+            if view_revision_id in seen:
+                continue
+            seen.append(view_revision_id)
+            self._notify_revalidation_locked(view_revision_id)
+
+    def _notify_revalidation_locked(self, identifier: str) -> None:
+        callback = self._revalidation_callback
+        if callback is None:
+            if not self._warned_missing_revalidation:
+                self._warned_missing_revalidation = True
+                logger.warning(
+                    "revalidation_callback is not configured; needs_revalidation was not marked "
+                    "for %s",
+                    identifier,
+                )
+            return
+        callback(identifier)
 
     def _find_locked(self, view_revision_id: str, block_or_claim_id: str) -> _ActiveEntry | None:
         for entry in self._entries.values():
@@ -643,6 +743,9 @@ class ProjectionRegistry:
             raise ValueError("removed must be a list")
         if not isinstance(positions_raw, list):
             raise ValueError("validated_positions must be a list")
+        modes_raw = payload.get("construction_modes", {})
+        if not isinstance(modes_raw, dict):
+            raise ValueError("construction_modes must be a dict")
         seq = payload.get("removal_seq")
         if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
             raise ValueError("removal_seq must be an int >= 0")
@@ -653,19 +756,23 @@ class ProjectionRegistry:
         removed = [
             RemovalRecord.from_dict(_require_mapping(item, "removal")) for item in removed_raw
         ]
-        validated: set[tuple[str, str]] = set()
+        validated: dict[tuple[str, str], dict[str, str] | None] = {}
         for item in positions_raw:
             position = _require_mapping(item, "validated_position")
-            validated.add(
-                (
-                    _require_str(position.get("view_revision_id"), "view_revision_id"),
-                    _require_str(position.get("block_or_claim_id"), "block_or_claim_id"),
-                )
+            key = (
+                _require_str(position.get("view_revision_id"), "view_revision_id"),
+                _require_str(position.get("block_or_claim_id"), "block_or_claim_id"),
             )
+            validated[key] = _provenance_record(position)
+        modes = {
+            _require_str(revision_key, "construction_modes"): _require_str(mode, "construction_modes")
+            for revision_key, mode in modes_raw.items()
+        }
         with self._lock:
             self._entries = entries
             self._removed = removed
             self._validated = validated
+            self._construction_modes = modes
             self._removal_seq = seq
             if persist:
                 self._save_locked()
@@ -682,6 +789,53 @@ class ProjectionRegistry:
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         temporary.write_text(text, encoding="utf-8")
         temporary.replace(self.path)
+
+
+def _fork_identity(provenance: Mapping[str, Any] | None) -> tuple[str, str] | None:
+    if not isinstance(provenance, Mapping):
+        return None
+    fork_node_id = provenance.get("fork_node_id")
+    revision_id = provenance.get("revision_id")
+    if not isinstance(revision_id, str) or not revision_id.strip():
+        revision_id = provenance.get("fork_revision_id")
+    if (
+        isinstance(fork_node_id, str)
+        and fork_node_id.strip()
+        and isinstance(revision_id, str)
+        and revision_id.strip()
+    ):
+        return fork_node_id.strip(), revision_id.strip()
+    return None
+
+
+def _provenance_record(provenance: Mapping[str, Any] | None) -> dict[str, str] | None:
+    identity = _fork_identity(provenance)
+    if identity is None:
+        return None
+    return {"fork_node_id": identity[0], "revision_id": identity[1]}
+
+
+def _authoritative_grounding_reason(
+    record: Mapping[str, Any] | None,
+    view_revision_id: str,
+    block_or_claim_id: str,
+) -> str | None:
+    label = f"{view_revision_id}:{block_or_claim_id}"
+    if not isinstance(record, Mapping):
+        return f"cannot promote without validated ForkRevision grounding for {label}"
+    status = record.get("status")
+    if status != FORK_STATUS_VALIDATED:
+        return (
+            f"cannot promote: ForkRevision status is {status!r}, expected 'validated' for {label}"
+        )
+    if record.get("position_match") is not True:
+        return f"cannot promote: grounding position does not match {label}"
+    if _fork_identity(record) is None:
+        return (
+            "cannot promote: authoritative ForkRevision is missing fork_provenance "
+            f"(fork_node_id and revision_id) for {label}"
+        )
+    return None
 
 
 def _cards_from_revision(

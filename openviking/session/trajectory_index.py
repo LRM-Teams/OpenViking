@@ -51,6 +51,7 @@ Priority = Literal[0, 1, 2]
 SkipReason = Literal["budget_exhausted", "paused"]
 Builder = Callable[[str, str, str], InfluenceViewRevision]
 FallbackSession = Callable[["IndexJob"], Mapping[str, Any]]
+RevalidationCallback = Callable[[str], None]
 Clock = Callable[[], datetime]
 
 
@@ -289,6 +290,7 @@ class TrajectoryIndexService:
         fallback_session: FallbackSession | None = None,
         clock: Clock | None = None,
         projection_registry: ProjectionRegistry | None = None,
+        revalidation_callback: RevalidationCallback | None = None,
     ) -> None:
         if not isinstance(supersede_index, ViewSupersedeIndex):
             raise ValueError("supersede_index must be a ViewSupersedeIndex")
@@ -300,11 +302,13 @@ class TrajectoryIndexService:
         self._builder = builder
         self._fallback_session = fallback_session
         self._clock = clock or _utc_now
+        self._revalidation_callback = revalidation_callback
         self._lock = threading.RLock()
         self._pending: dict[str, IndexJob] = {}
         self._deferred: dict[str, list[IndexJob]] = {}
         self._build_timestamps: list[str] = []
         self._warned_missing_projection_registry = False
+        self._warned_missing_revalidation = False
         self._load()
 
     def enqueue(self, job: IndexJob) -> IndexJob:
@@ -379,8 +383,11 @@ class TrajectoryIndexService:
             if not self._budget_allows_locked(policy):
                 return SkippedResult(reason=SKIP_BUDGET_EXHAUSTED, job_id=nxt.job_id)
             revision = self._build_locked(nxt)
+            previous = self._supersede.latest(revision.session_id, revision.purpose)
             if not self._content_hash_registered_locked(revision):
                 self._supersede.register(revision)
+                if previous is not None and previous.revision_id != revision.revision_id:
+                    self._notify_revalidation_locked(previous.revision_id)
             self._sync_projections_locked(revision)
             self._pending.pop(nxt.session_id, None)
             self._build_timestamps.append(_format_dt(_as_utc(self._clock())))
@@ -408,6 +415,7 @@ class TrajectoryIndexService:
         fallback_session: FallbackSession | None = None,
         clock: Clock | None = None,
         projection_registry: ProjectionRegistry | None = None,
+        revalidation_callback: RevalidationCallback | None = None,
     ) -> TrajectoryIndexService:
         service = cls(
             path,
@@ -416,6 +424,7 @@ class TrajectoryIndexService:
             fallback_session=fallback_session,
             clock=clock,
             projection_registry=projection_registry,
+            revalidation_callback=revalidation_callback,
         )
         service._apply(data, persist=True)
         return service
@@ -472,6 +481,19 @@ class TrajectoryIndexService:
             revision.purpose,
             revision.revision_id,
         )
+
+    def _notify_revalidation_locked(self, identifier: str) -> None:
+        callback = self._revalidation_callback
+        if callback is None:
+            if not self._warned_missing_revalidation:
+                self._warned_missing_revalidation = True
+                logger.warning(
+                    "revalidation_callback is not configured; needs_revalidation was not marked "
+                    "for %s",
+                    identifier,
+                )
+            return
+        callback(identifier)
 
     def _select_locked(self) -> IndexJob | None:
         if not self._pending:

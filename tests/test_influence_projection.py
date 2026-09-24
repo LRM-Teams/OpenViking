@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -217,11 +218,26 @@ def test_promote_rejects_without_validated_grounding(tmp_path) -> None:
 
 
 def test_promote_with_grounding_query_marks_verified(tmp_path) -> None:
-    revision = _fallback(SESSION, "rev-1")
+    blocks = [_block("block-a", 1)]
+    revision = InfluenceViewDraft(
+        view_id="view-rev-1",
+        purpose=PURPOSE_POST_RUN_INDEX,
+        session_id=SESSION,
+        task_run_id="task-rev-1",
+        coverage=_coverage(blocks),
+        blocks=blocks,
+    ).freeze(revision_id="rev-1", frozen_at=CREATED)
     block_id = revision.blocks[0].block_id
 
-    def grounding_query(view_revision_id: str, position_id: str) -> bool:
-        return view_revision_id == revision.revision_id and position_id == block_id
+    def grounding_query(view_revision_id: str, position_id: str):
+        if view_revision_id == revision.revision_id and position_id == block_id:
+            return {
+                "fork_node_id": "fork-1",
+                "revision_id": "fr-1",
+                "status": "validated",
+                "position_match": True,
+            }
+        return None
 
     registry = _registry(tmp_path, grounding_query=grounding_query)
     registry.register(revision, acl_labels=("team-a",))
@@ -257,12 +273,12 @@ def test_promote_with_registration_validation_marks_verified(tmp_path) -> None:
 
 def test_registry_round_trip(tmp_path) -> None:
     registry = _registry(tmp_path)
-    revision = _fallback(SESSION, "rev-1")
+    revision = _revision_with_claim(revision_id="rev-1")
     registry.register(revision, acl_labels=("team-a",), validated_positions=(revision.blocks[0].block_id,))
     registry.promote_to_verified(
         revision.revision_id,
         revision.blocks[0].block_id,
-        {"fork_revision_id": "fr-1"},
+        {"fork_node_id": "fork-1", "fork_revision_id": "fr-1"},
     )
     payload = json.loads(json.dumps(registry.to_dict()))
     restored = ProjectionRegistry.from_dict(payload, path=tmp_path / "copy.json", clock=_clock)
@@ -286,3 +302,102 @@ def test_withdraw_superseded_keeps_named_revision_and_audits_the_rest(tmp_path) 
     registry.register(_fallback(SESSION, "rev-2"), acl_labels=("team",))
     found = registry.search(principal_labels=("team",))
     assert {card.source_pointer.view_revision_id for card in found} == {"rev-2", "rev-diag"}
+
+
+def _authoritative(status: str, position_match: bool) -> dict:
+    return {
+        "fork_node_id": "fork-1",
+        "revision_id": "fr-1",
+        "status": status,
+        "position_match": position_match,
+    }
+
+
+def test_promote_follows_authoritative_fork_status_and_position(tmp_path) -> None:
+    revision = _revision_with_claim()
+    block_id = revision.blocks[0].block_id
+    state = _authoritative("provisional", True)
+
+    def grounding_query(view_revision_id: str, position_id: str):
+        if view_revision_id == revision.revision_id and position_id == block_id:
+            return dict(state)
+        return None
+
+    registry = _registry(tmp_path, grounding_query=grounding_query)
+    registry.register(revision, acl_labels=("team-a",))
+    provenance = {"fork_node_id": "fork-1", "revision_id": "fr-1"}
+    with pytest.raises(ValueError, match="provisional"):
+        registry.promote_to_verified(revision.revision_id, block_id, provenance)
+    state["status"] = "validated"
+    state["position_match"] = False
+    with pytest.raises(ValueError, match="position"):
+        registry.promote_to_verified(revision.revision_id, block_id, provenance)
+    state["position_match"] = True
+    card = registry.promote_to_verified(revision.revision_id, block_id, provenance)
+    assert card.status == CARD_STATUS_VERIFIED
+    assert card.fork_provenance == provenance
+
+
+def test_promote_rejects_fallback_view_even_with_validated_grounding(tmp_path) -> None:
+    revision = _fallback(SESSION, "rev-fb")
+    block_id = revision.blocks[0].block_id
+
+    def grounding_query(view_revision_id: str, position_id: str):
+        del view_revision_id, position_id
+        return _authoritative("validated", True)
+
+    registry = _registry(tmp_path, grounding_query=grounding_query)
+    registry.register(revision, acl_labels=("team-a",))
+    with pytest.raises(ValueError, match="ADR #72"):
+        registry.promote_to_verified(
+            revision.revision_id,
+            block_id,
+            {"fork_node_id": "fork-1", "revision_id": "fr-1"},
+        )
+    assert registry.search(principal_labels=("team-a",))[0].status == CARD_STATUS_PROVISIONAL
+
+
+def test_promote_rejects_static_positions_without_fork_provenance(tmp_path) -> None:
+    revision = _revision_with_claim()
+    registry = _registry(tmp_path)
+    registry.register(revision, acl_labels=("team-a",), validated_positions=("claim-1",))
+    with pytest.raises(ValueError, match="fork_provenance"):
+        registry.promote_to_verified(revision.revision_id, "claim-1", {"fork_revision_id": "fr-1"})
+    assert registry.search(principal_labels=("team-a",), kind=CARD_KIND_CLAIM)[0].status == (
+        CARD_STATUS_PROVISIONAL
+    )
+
+
+def test_acl_change_calls_revalidation_callback_with_session(tmp_path) -> None:
+    seen: list[str] = []
+    registry = _registry(tmp_path, revalidation_callback=seen.append)
+    registry.register(_fallback(SESSION, "rev-1"), acl_labels=("team-a",))
+    registry.register(_fallback(OTHER, "rev-2"), acl_labels=("team-b",))
+    removed = registry.handle_acl_change(SESSION, ("team-b",))
+    assert len(removed) == 1
+    assert seen == [SESSION]
+
+
+def test_acl_change_without_revalidation_callback_warns_once(tmp_path, caplog) -> None:
+    registry = _registry(tmp_path)
+    registry.register(_fallback(SESSION, "rev-1"), acl_labels=("team-a",))
+    registry.register(_fallback(OTHER, "rev-2"), acl_labels=("team-b",))
+    with caplog.at_level(logging.WARNING):
+        registry.handle_acl_change(SESSION, ("team-c",))
+        registry.handle_acl_change(OTHER, ("team-d",))
+    warnings = [record for record in caplog.records if "revalidation_callback" in record.message]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+
+
+def test_withdraw_superseded_calls_revalidation_callback(tmp_path) -> None:
+    seen: list[str] = []
+    registry = _registry(tmp_path, revalidation_callback=seen.append)
+    registry.register(_fallback(SESSION, "rev-1"), acl_labels=("team",))
+    registry.register(
+        _fallback(SESSION, "rev-diag", purpose=PURPOSE_FAILURE_DIAGNOSIS),
+        acl_labels=("team",),
+    )
+    removed = registry.withdraw_superseded(SESSION, PURPOSE_POST_RUN_INDEX, "rev-2")
+    assert [record.card.source_pointer.view_revision_id for record in removed] == ["rev-1"]
+    assert seen == ["rev-1"]
