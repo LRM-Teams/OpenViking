@@ -384,16 +384,23 @@ class OutcomeRecord:
 
 @dataclass(frozen=True)
 class TargetPreference:
-    """Target-agent delivery preference. ``defer_all`` is not a proxy adopt/reject."""
+    """Target-agent delivery preference. ``defer_all`` is not a proxy adopt/reject.
+
+    ``silence_all`` is the user-silence preference: deliveries still record
+    exposure and do not expect a disposition.
+    """
 
     target_agent_id: str
     defer_all: bool = False
     blocked_kinds: tuple[str, ...] = ()
+    silence_all: bool = False
 
     def __post_init__(self) -> None:
         _require_str(self.target_agent_id, "target_agent_id")
         if not isinstance(self.defer_all, bool):
             raise TypeError("defer_all must be a bool")
+        if not isinstance(self.silence_all, bool):
+            raise TypeError("silence_all must be a bool")
         if not isinstance(self.blocked_kinds, tuple):
             raise TypeError("blocked_kinds must be a tuple of source kinds")
         kinds = _freeze_strs(self.blocked_kinds, "blocked_kinds")
@@ -407,6 +414,7 @@ class TargetPreference:
             "target_agent_id": self.target_agent_id,
             "defer_all": self.defer_all,
             "blocked_kinds": list(self.blocked_kinds),
+            "silence_all": self.silence_all,
         }
 
     @classmethod
@@ -418,6 +426,64 @@ class TargetPreference:
             target_agent_id=_require_str(data["target_agent_id"], "target_agent_id"),
             defer_all=bool(data.get("defer_all", False)),
             blocked_kinds=tuple(kinds),
+            silence_all=bool(data.get("silence_all", False)),
+        )
+
+
+@dataclass(frozen=True)
+class DispositionAmendment:
+    """Correction appended after the authoritative disposition.
+
+    The first disposition remains the decision. An amendment may replace
+    ``reason`` and ``intended_action_refs`` only; it cannot flip ``decision``.
+    """
+
+    hint_id: str
+    reason: str
+    intended_action_refs: tuple[str, ...]
+    amended_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_str(self.hint_id, "hint_id")
+        _require_str(self.reason, "reason")
+        if not isinstance(self.intended_action_refs, tuple):
+            raise TypeError("intended_action_refs must be a tuple of strings")
+        object.__setattr__(
+            self,
+            "intended_action_refs",
+            _freeze_strs(self.intended_action_refs, "intended_action_refs"),
+        )
+        object.__setattr__(self, "amended_at", _parse_dt(self.amended_at, "amended_at"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "hint_id": self.hint_id,
+            "reason": self.reason,
+            "intended_action_refs": list(self.intended_action_refs),
+            "amended_at": _format_dt(self.amended_at),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DispositionAmendment:
+        refs = data["intended_action_refs"]
+        if not isinstance(refs, (list, tuple)):
+            raise TypeError("intended_action_refs must be a list of strings")
+        return cls(
+            hint_id=_require_str(data["hint_id"], "hint_id"),
+            reason=_require_str(data["reason"], "reason"),
+            intended_action_refs=tuple(refs),
+            amended_at=_parse_dt(data["amended_at"], "amended_at"),
+        )
+
+
+class DuplicateDisposition(Exception):
+    """Raised when a hint already has a disposition."""
+
+    def __init__(self, hint_id: str, existing: MemoryDisposition) -> None:
+        self.hint_id = hint_id
+        self.existing = existing
+        super().__init__(
+            f"duplicate disposition for {hint_id}: existing decision {existing.decision}"
         )
 
 
@@ -493,6 +559,8 @@ class HintDeliveryService:
         self._hint_order: list[str] = []
         self._provenance_index: dict[tuple[str, str, str], str] = {}
         self._dispositions: list[MemoryDisposition] = []
+        self._amendments: list[DispositionAmendment] = []
+        self._silenced_hint_ids: set[str] = set()
         self._followthroughs: list[FollowthroughRecord] = []
         self._outcomes: list[OutcomeRecord] = []
         self._preferences: dict[str, TargetPreference] = {}
@@ -521,6 +589,26 @@ class HintDeliveryService:
             self._persist()
         return preference
 
+    def silence(self, target_agent_id: str) -> TargetPreference:
+        """Record user silence for ``target_agent_id``.
+
+        Deliveries during silence still record exposure and do not expect a
+        disposition. This extends the defer-all preference with ``silence_all``
+        instead of writing a proxy adopt/reject.
+        """
+        agent = _require_str(target_agent_id, "target_agent_id")
+        with self._lock:
+            current = self._preferences.get(agent)
+            preference = TargetPreference(
+                target_agent_id=agent,
+                defer_all=current.defer_all if current is not None else False,
+                blocked_kinds=current.blocked_kinds if current is not None else (),
+                silence_all=True,
+            )
+            self._preferences[agent] = preference
+            self._persist()
+        return preference
+
     def deliver(
         self,
         hint: MemoryHint,
@@ -531,7 +619,8 @@ class HintDeliveryService:
         Records one hint exposure when a new hint is accepted. Same source-set
         provenance does not resend: TTL is refreshed and the original hint_id
         is returned. ``defer_all`` still records exposure, then appends a
-        system disposition with reason ``preference_defer_all``.
+        system disposition with reason ``preference_defer_all``. ``silence_all``
+        still records exposure and does not append a disposition.
         """
         if not isinstance(hint, MemoryHint):
             raise TypeError("hint must be a MemoryHint")
@@ -595,20 +684,71 @@ class HintDeliveryService:
                         decided_at=now,
                     )
                 )
+            elif preference is not None and preference.silence_all:
+                self._silenced_hint_ids.add(hint.hint_id)
             self._persist()
             return hint
 
     def record_disposition(self, disposition: MemoryDisposition) -> MemoryDisposition:
-        """Append a target-agent disposition. A mismatched agent is rejected."""
+        """Append the first target-agent disposition. A mismatched agent is rejected.
+
+        Each hint accepts one disposition. A later call raises
+        ``DuplicateDisposition`` carrying the existing decision. Corrections go
+        through ``amend_disposition`` and cannot flip that decision.
+        """
         if not isinstance(disposition, MemoryDisposition):
             raise TypeError("disposition must be a MemoryDisposition")
         with self._lock:
             hint = self._require_hint(disposition.hint_id)
             if disposition.target_agent_id != hint.target_agent_id:
                 raise ValueError("disposition target_agent_id must match the hint target")
+            existing = self._first_disposition_locked(disposition.hint_id)
+            if existing is not None:
+                raise DuplicateDisposition(disposition.hint_id, existing)
             self._dispositions.append(disposition)
+            self._silenced_hint_ids.discard(disposition.hint_id)
             self._persist()
             return disposition
+
+    def amend_disposition(
+        self,
+        hint_id: str,
+        *,
+        reason: str = "correction",
+        intended_action_refs: Iterable[str] | None = None,
+        decision: str | None = None,
+        amended_at: datetime | None = None,
+    ) -> DispositionAmendment:
+        """Append a correction event. The first disposition stays authoritative.
+
+        Amendments may correct ``reason`` and ``intended_action_refs`` only.
+        They cannot flip ``decision``: a different ``decision`` raises
+        ``ValueError``. The stored first record is not rewritten; readers of
+        ``dispositions`` see the latest corrected reason and refs with the
+        original decision.
+        """
+        with self._lock:
+            existing = self._first_disposition_locked(hint_id)
+            if existing is None:
+                self._require_hint(hint_id)
+                raise ValueError(f"no disposition to amend for {hint_id}")
+            if decision is not None and decision != existing.decision:
+                raise ValueError("amend_disposition cannot flip decision")
+            current = self._effective_disposition_locked(existing)
+            refs = (
+                current.intended_action_refs
+                if intended_action_refs is None
+                else _freeze_strs(intended_action_refs, "intended_action_refs")
+            )
+            amendment = DispositionAmendment(
+                hint_id=existing.hint_id,
+                reason=reason,
+                intended_action_refs=refs,
+                amended_at=amended_at or self._clock(),
+            )
+            self._amendments.append(amendment)
+            self._persist()
+            return amendment
 
     def record_followthrough(self, record: FollowthroughRecord) -> FollowthroughRecord:
         """Append followthrough. Does not overwrite disposition or outcome."""
@@ -661,8 +801,16 @@ class HintDeliveryService:
             return tuple(self._hints[hint_id] for hint_id in self._hint_order)
 
     def dispositions(self, hint_id: str | None = None) -> tuple[MemoryDisposition, ...]:
+        """Authoritative decisions. Later amendments correct reason and refs only."""
         with self._lock:
             rows = self._dispositions
+            if hint_id is not None:
+                rows = [row for row in rows if row.hint_id == hint_id]
+            return tuple(self._effective_disposition_locked(row) for row in rows)
+
+    def amendments(self, hint_id: str | None = None) -> tuple[DispositionAmendment, ...]:
+        with self._lock:
+            rows = self._amendments
             if hint_id is not None:
                 rows = [row for row in rows if row.hint_id == hint_id]
             return tuple(rows)
@@ -700,13 +848,34 @@ class HintDeliveryService:
         for hint_id, hint in self._hints.items():
             if hint.task_id != task_id or hint.target_agent_id != target_agent_id:
                 continue
-            if hint_id in self._expired or self._has_disposition_locked(hint_id):
+            if hint_id in self._expired or hint_id in self._silenced_hint_ids:
+                continue
+            if self._has_disposition_locked(hint_id):
                 continue
             count += 1
         return count
 
     def _has_disposition_locked(self, hint_id: str) -> bool:
         return any(row.hint_id == hint_id for row in self._dispositions)
+
+    def _first_disposition_locked(self, hint_id: str) -> MemoryDisposition | None:
+        for row in self._dispositions:
+            if row.hint_id == hint_id:
+                return row
+        return None
+
+    def _effective_disposition_locked(self, row: MemoryDisposition) -> MemoryDisposition:
+        latest = None
+        for amendment in self._amendments:
+            if amendment.hint_id == row.hint_id:
+                latest = amendment
+        if latest is None:
+            return row
+        return replace(
+            row,
+            reason=latest.reason,
+            intended_action_refs=latest.intended_action_refs,
+        )
 
     def _require_hint(self, hint_id: str) -> MemoryHint:
         hint = self._hints.get(hint_id)
@@ -742,6 +911,8 @@ class HintDeliveryService:
         return {
             "hints": [self._hints[hint_id].to_dict() for hint_id in self._hint_order],
             "dispositions": [row.to_dict() for row in self._dispositions],
+            "amendments": [row.to_dict() for row in self._amendments],
+            "silenced_hint_ids": sorted(self._silenced_hint_ids),
             "followthroughs": [row.to_dict() for row in self._followthroughs],
             "outcomes": [row.to_dict() for row in self._outcomes],
             "preferences": [pref.to_dict() for pref in self._preferences.values()],
@@ -774,6 +945,8 @@ class HintDeliveryService:
                 hint.hint_id
             )
         dispositions = [MemoryDisposition.from_dict(raw) for raw in payload.get("dispositions", [])]
+        amendments = [DispositionAmendment.from_dict(raw) for raw in payload.get("amendments", [])]
+        silenced = payload.get("silenced_hint_ids", [])
         followthroughs = [
             FollowthroughRecord.from_dict(raw) for raw in payload.get("followthroughs", [])
         ]
@@ -794,6 +967,8 @@ class HintDeliveryService:
         self._hint_order = order
         self._provenance_index = index
         self._dispositions = dispositions
+        self._amendments = amendments
+        self._silenced_hint_ids = {hint_id for hint_id in silenced if isinstance(hint_id, str)}
         self._followthroughs = followthroughs
         self._outcomes = outcomes
         self._preferences = preferences

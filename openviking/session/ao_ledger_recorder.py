@@ -9,6 +9,7 @@ cannot break (ADR-0002: attribution is a separate append-only file).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from datetime import datetime, timezone
@@ -201,8 +202,16 @@ def _tool_call_dict(part: Any) -> dict[str, Any]:
     return payload
 
 
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def _exchange_dedup_key(message_ref: dict[str, Any] | None) -> tuple[str, str] | None:
-    """Dedup key ``(message_id, tool_call_id)``. Incomplete refs are not keyed."""
+    """Primary dedup key ``(message_id, tool_call_id)``.
+
+    Both ids are required. A missing id is not a primary key; callers build a
+    ``key_kind=fallback`` key instead of skipping dedup.
+    """
     if not message_ref:
         return None
     message_id = str(message_ref.get("message_id") or "")
@@ -210,6 +219,50 @@ def _exchange_dedup_key(message_ref: dict[str, Any] | None) -> tuple[str, str] |
     if not message_id or not tool_call_id:
         return None
     return message_id, tool_call_id
+
+
+def _fallback_dedup_digest(
+    session_id: str,
+    tool_name: str,
+    params: Any,
+    observation_summary: str,
+) -> str:
+    """Stable fallback identity: session, tool, canonical params, observation summary."""
+    body = {
+        "session_id": session_id,
+        "tool_name": tool_name,
+        "params": params,
+        "observation_summary": observation_summary,
+    }
+    return hashlib.sha256(_canonical_json(body).encode("utf-8")).hexdigest()
+
+
+def _fallback_digest_from_parts(session_id: str, action: dict[str, Any], observation: dict[str, Any]) -> str | None:
+    tool_name = str(action.get("tool") or "")
+    if not session_id or not tool_name or "arguments" not in action:
+        return None
+    summary = observation.get("summary")
+    if isinstance(summary, str):
+        summary_text = summary
+    elif isinstance(summary, list) and summary:
+        summary_text = "\n".join(str(item) for item in summary)
+    else:
+        return None
+    return _fallback_dedup_digest(session_id, tool_name, action.get("arguments"), summary_text)
+
+
+def _stored_dedup_identity(record: AORecord) -> tuple[str, ...]:
+    """Identity already written on a ledger row, else a recomputed fallback."""
+    message_ref = record.message_ref or {}
+    if message_ref.get("key_kind") == "fallback" and message_ref.get("dedup_key"):
+        return ("fallback", str(message_ref["dedup_key"]))
+    primary = _exchange_dedup_key(record.message_ref)
+    if primary is not None:
+        return ("primary", primary[0], primary[1])
+    digest = _fallback_digest_from_parts(record.session_id, record.action, record.observation)
+    if digest is None:
+        return ()
+    return ("fallback", digest)
 
 
 def _tool_result_payload(part: Any) -> Any:
@@ -256,11 +309,11 @@ class AOLedgerRecorder:
         self.session_dir = Path(session_dir)
         self.ledger = AOLedger(self.session_dir, session_id)
         self.duplicate_skip_count = 0
-        self._seen_exchange_keys: set[tuple[str, str]] = set()
+        self._seen_exchange_keys: set[tuple[str, ...]] = set()
         self._dedup_lock = threading.Lock()
         for record in self.ledger.records():
-            key = _exchange_dedup_key(record.message_ref)
-            if key is not None:
+            key = _stored_dedup_identity(record)
+            if key:
                 self._seen_exchange_keys.add(key)
 
     def record_tool_exchange(
@@ -269,40 +322,73 @@ class AOLedgerRecorder:
         tool_result: Any,
         message_ref: dict[str, Any] | None = None,
     ) -> AORecord | None:
-        """Append one AO pair. Failures are logged and do not raise.
+        """Append one AO pair.
 
-        A repeat of the same ``(message_id, tool_call_id)`` is skipped, counted
-        on ``duplicate_skip_count``, and logged at debug. The tool call id is
-        ``message_ref['tool_call_id']`` or the session ``tool_id`` alias.
+        Dedup prefers ``(message_id, tool_call_id)`` (``tool_call_id`` or the
+        session ``tool_id`` alias). When either id is missing, a fallback key
+        is recorded with ``key_kind=fallback``: ``session_id``, tool name,
+        canonical parameter hash, and the paired observation-summary hash.
+        A repeat of either key is skipped, counted on ``duplicate_skip_count``,
+        and logged at debug. If neither key can be built, the AO is not written
+        and ``ValueError`` is raised. Other failures are logged and do not raise.
         """
-        dedup_key = _exchange_dedup_key(message_ref)
         claimed = False
+        dedup_key: tuple[str, ...] | None = None
         try:
-            if dedup_key is not None:
-                with self._dedup_lock:
-                    if dedup_key in self._seen_exchange_keys:
-                        self.duplicate_skip_count += 1
-                        logger.debug(
-                            "skip duplicate AO record message_id=%s tool_call_id=%s",
-                            dedup_key[0],
-                            dedup_key[1],
-                        )
-                        return None
-                    self._seen_exchange_keys.add(dedup_key)
-                    claimed = True
+            primary = _exchange_dedup_key(message_ref)
             action = _action_from_tool_call(dict(tool_call))
-            observation = build_observation(_observation_content(tool_result))
+            observation: dict[str, Any] | None = None
+            if primary is not None:
+                dedup_key = ("primary", primary[0], primary[1])
+            else:
+                if tool_result is not None and action.get("tool") and "arguments" in action:
+                    observation = build_observation(_observation_content(tool_result))
+                    digest = _fallback_digest_from_parts(self.session_id, action, observation)
+                else:
+                    digest = None
+                if digest is None:
+                    raise ValueError(
+                        "cannot construct AO dedup key: message_id/tool_call_id missing "
+                        "and fallback key incomplete"
+                    )
+                dedup_key = ("fallback", digest)
+            with self._dedup_lock:
+                if dedup_key in self._seen_exchange_keys:
+                    self.duplicate_skip_count += 1
+                    logger.debug(
+                        "skip duplicate AO record key_kind=%s dedup_key=%s",
+                        dedup_key[0],
+                        dedup_key[-1],
+                    )
+                    return None
+                self._seen_exchange_keys.add(dedup_key)
+                claimed = True
+            if observation is None:
+                observation = build_observation(_observation_content(tool_result))
             artifact_ref = _extract_artifact_ref(tool_call, tool_result, message_ref)
             if artifact_ref:
                 observation["artifact_ref"] = artifact_ref
+            stored_ref = dict(message_ref) if message_ref else None
+            if dedup_key[0] == "fallback":
+                stored_ref = dict(stored_ref or {})
+                stored_ref["key_kind"] = "fallback"
+                stored_ref["dedup_key"] = dedup_key[1]
             return self.ledger.append(
                 action=action,
                 observation=observation,
                 skill_invocations=extract_skill_invocations(
                     dict(tool_call), session_id=self.session_id
                 ),
-                message_ref=message_ref,
+                message_ref=stored_ref,
             )
+        except ValueError:
+            if claimed and dedup_key is not None:
+                with self._dedup_lock:
+                    self._seen_exchange_keys.discard(dedup_key)
+            if claimed:
+                logger.warning("AO ledger record_tool_exchange failed", exc_info=True)
+                return None
+            raise
         except Exception:
             if claimed and dedup_key is not None:
                 with self._dedup_lock:

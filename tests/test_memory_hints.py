@@ -16,6 +16,7 @@ from openviking.session.citation_ledger import KIND_HINT_EXPOSURE, CitationLedge
 from openviking.session.memory_hints import (
     BlockedKindRejected,
     CooldownActive,
+    DuplicateDisposition,
     FollowthroughRecord,
     HintDeliveryService,
     MemoryDisposition,
@@ -87,7 +88,7 @@ def _service(
 
 
 def _exposures(ledger: CitationLedger) -> list:
-    return [event for event in ledger.events() if event.kind == KIND_HINT_EXPOSURE]
+    return [event for event in ledger.events(require_admin=True) if event.kind == KIND_HINT_EXPOSURE]
 
 
 def test_pending_cap_blocks_third_until_disposition(tmp_path: Path) -> None:
@@ -283,3 +284,58 @@ def test_hint_types_expose_no_execute_api() -> None:
         for name, member in inspect.getmembers(cls, predicate=callable):
             assert name not in forbidden
     assert "not executable, target agent decides" in (MemoryHint.__doc__ or "")
+
+
+def test_disposition_is_unique_and_amend_cannot_flip_decision(tmp_path: Path) -> None:
+    service, _, clock = _service(tmp_path)
+    service.deliver(_hint("h1"), clock)
+    first = service.record_disposition(
+        MemoryDisposition(
+            hint_id="h1",
+            target_agent_id="agent-1",
+            decision="reject",
+            reason="out of scope",
+            intended_action_refs=("action-1",),
+            decided_at=clock.current,
+        )
+    )
+    with pytest.raises(DuplicateDisposition) as exc_info:
+        service.record_disposition(
+            MemoryDisposition(
+                hint_id="h1",
+                target_agent_id="agent-1",
+                decision="adopt",
+                reason="changed mind",
+                intended_action_refs=(),
+                decided_at=clock.current,
+            )
+        )
+    assert exc_info.value.existing.decision == "reject"
+    assert service.dispositions("h1") == (first,)
+
+    amended = service.amend_disposition(
+        "h1",
+        reason="wording fix",
+        intended_action_refs=("action-2",),
+    )
+    assert amended.reason == "wording fix"
+    visible = service.dispositions("h1")[0]
+    assert visible.decision == "reject"
+    assert visible.reason == "wording fix"
+    assert visible.intended_action_refs == ("action-2",)
+    with pytest.raises(ValueError, match="cannot flip decision"):
+        service.amend_disposition("h1", reason="nope", decision="adopt")
+    assert service.dispositions("h1")[0].decision == "reject"
+    assert len(service.amendments("h1")) == 1
+
+
+def test_silence_records_exposure_without_expecting_disposition(tmp_path: Path) -> None:
+    service, ledger, clock = _service(tmp_path)
+    preference = service.silence("agent-1")
+    assert preference.silence_all is True
+    delivered = service.deliver(_hint("h1"), clock)
+    assert delivered.hint_id == "h1"
+    assert len(_exposures(ledger)) == 1
+    assert service.dispositions("h1") == ()
+    assert service.pending_count("task-1", "agent-1") == 0
+    assert service.state("h1") == "pending"

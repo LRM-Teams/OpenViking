@@ -125,6 +125,14 @@ HAPPY_PATH_EVENTS: tuple[str, ...] = (
 )
 
 
+class MissingTransitionEvidence(Exception):
+    """Raised when a guarded transition has no envelope or revision evidence."""
+
+    def __init__(self, event: str) -> None:
+        self.event = event
+        super().__init__(f"missing transition evidence for {event}")
+
+
 class IllegalTransition(Exception):
     """Raised when ``advance`` requests a transition absent from the guard."""
 
@@ -162,6 +170,16 @@ def _require_str(value: Any, field: str) -> str:
 
 def _canonical_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _copy_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    copied: dict[str, Any] = {}
+    for key, value in evidence.items():
+        if isinstance(value, (list, tuple)):
+            copied[str(key)] = [str(item) for item in value]
+        else:
+            copied[str(key)] = value
+    return copied
 
 
 def _payload_hash(payload: Mapping[str, Any] | None) -> str:
@@ -329,6 +347,7 @@ class StateEvent:
     event: str
     payload_hash: str
     occurred_at: str
+    evidence: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _require_str(self.state_event_id, "state_event_id")
@@ -339,9 +358,11 @@ class StateEvent:
         _require_str(self.event, "event")
         _require_str(self.payload_hash, "payload_hash")
         _parse_dt(self.occurred_at)
+        if self.evidence is not None:
+            object.__setattr__(self, "evidence", _copy_evidence(self.evidence))
 
-    def to_dict(self) -> dict[str, str]:
-        return {
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "state_event_id": self.state_event_id,
             "from": self.from_state.value,
             "to": self.to_state.value,
@@ -349,6 +370,9 @@ class StateEvent:
             "payload_hash": self.payload_hash,
             "occurred_at": self.occurred_at,
         }
+        if self.evidence:
+            payload["evidence"] = _copy_evidence(self.evidence)
+        return payload
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> StateEvent:
@@ -359,6 +383,7 @@ class StateEvent:
             event=_require_str(data["event"], "event"),
             payload_hash=_require_str(data["payload_hash"], "payload_hash"),
             occurred_at=_require_str(data["occurred_at"], "occurred_at"),
+            evidence=_copy_evidence(data["evidence"]) if isinstance(data.get("evidence"), Mapping) else None,
         )
 
 
@@ -432,10 +457,12 @@ class EvaluationOrchestrator:
         evaluation_id: str | None = None,
         clock: Clock | None = None,
         event_id_factory: IdFactory | None = None,
+        write_hooks: Mapping[str, Callable[..., Any]] | None = None,
     ) -> None:
         self._path = _resolve_store_path(path) if path is not None else None
         self._clock = clock or _utc_now
         self._ids = event_id_factory or (lambda: uuid.uuid4().hex)
+        self._write_hooks = dict(write_hooks) if write_hooks else {}
         self._lock = threading.Lock()
         self._evaluation_id = _require_str(evaluation_id, "evaluation_id") if evaluation_id else uuid.uuid4().hex
         self._state = OrchestratorState.CREATED
@@ -470,8 +497,25 @@ class EvaluationOrchestrator:
     def satisfied_conditions(self) -> tuple[str, ...]:
         return tuple(self._satisfied_conditions)
 
-    def advance(self, event: Any, payload: Mapping[str, Any] | None = None) -> StateEvent:
-        """Move one step. Illegal events, including any proposal, raise."""
+    def advance(
+        self,
+        event: Any,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        brief_envelope_id: str | None = None,
+        revision_ids: Iterable[str] | None = None,
+        outcome_envelope_id: str | None = None,
+    ) -> StateEvent:
+        """Move one step. Illegal events, including any proposal, raise.
+
+        Entering ``FREEZE_BRIEF`` requires ``brief_envelope_id``. Entering
+        ``COMMIT_REVISIONS`` requires ``revision_ids`` or
+        ``outcome_envelope_id``. When ``write_hooks`` supplies
+        ``on_brief_envelope`` or ``on_revision_commit``, the hook runs before
+        the transition and its returned id is stored on the event ``evidence``
+        field beside ``payload_hash``. Missing evidence raises
+        ``MissingTransitionEvidence`` and does not move state.
+        """
         with self._lock:
             self._reject_if_proposal(event)
             if not isinstance(event, str) or event == "":
@@ -481,6 +525,13 @@ class EvaluationOrchestrator:
             if target is None:
                 raise IllegalTransition(self._state, requested)
             body = dict(payload) if payload else {}
+            evidence = self._transition_evidence(
+                target,
+                body,
+                brief_envelope_id=brief_envelope_id,
+                revision_ids=revision_ids,
+                outcome_envelope_id=outcome_envelope_id,
+            )
             if target is OrchestratorState.WAITING_EXTERNAL:
                 conditions = _coerce_conditions(body)
             else:
@@ -494,6 +545,7 @@ class EvaluationOrchestrator:
                 event=event,
                 payload_hash=_payload_hash(body),
                 occurred_at=_format_dt(self._clock()),
+                evidence=evidence or None,
             )
             self._events.append(record)
             self._state = target
@@ -591,6 +643,49 @@ class EvaluationOrchestrator:
             self._proposals.append(record)
             self._persist()
             return record
+
+    def _transition_evidence(
+        self,
+        target: OrchestratorState,
+        body: Mapping[str, Any],
+        *,
+        brief_envelope_id: str | None,
+        revision_ids: Iterable[str] | None,
+        outcome_envelope_id: str | None,
+    ) -> dict[str, Any]:
+        if target is OrchestratorState.FREEZE_BRIEF:
+            envelope = brief_envelope_id or body.get("brief_envelope_id")
+            hook = self._write_hooks.get("on_brief_envelope")
+            if hook is not None:
+                returned = hook(body)
+                if isinstance(returned, str) and returned:
+                    envelope = returned
+            if not isinstance(envelope, str) or envelope == "":
+                raise MissingTransitionEvidence(EVENT_FREEZE_BRIEF)
+            return {"brief_envelope_id": envelope}
+        if target is OrchestratorState.COMMIT_REVISIONS:
+            revisions = list(revision_ids) if revision_ids is not None else body.get("revision_ids")
+            outcome = outcome_envelope_id or body.get("outcome_envelope_id")
+            hook = self._write_hooks.get("on_revision_commit")
+            if hook is not None:
+                returned = hook(body)
+                if isinstance(returned, (list, tuple)):
+                    revisions = list(returned)
+                elif isinstance(returned, str) and returned:
+                    outcome = returned
+            rev_list: list[str] = []
+            if isinstance(revisions, (list, tuple)):
+                rev_list = [item for item in revisions if isinstance(item, str) and item]
+            outcome_id = outcome if isinstance(outcome, str) and outcome else ""
+            if not rev_list and not outcome_id:
+                raise MissingTransitionEvidence(EVENT_COMMIT_REVISIONS)
+            evidence: dict[str, Any] = {}
+            if rev_list:
+                evidence["revision_ids"] = rev_list
+            if outcome_id:
+                evidence["outcome_envelope_id"] = outcome_id
+            return evidence
+        return {}
 
     def _reject_if_proposal(self, event: Any) -> None:
         if isinstance(event, AgentProposal):

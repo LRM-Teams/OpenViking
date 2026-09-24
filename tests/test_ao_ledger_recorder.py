@@ -100,6 +100,34 @@ def test_record_tool_exchange_dict_and_str(tmp_path: Path) -> None:
     assert recorder.ledger.count() == 2
 
 
+def test_fallback_dedup_key_skips_repeat_without_message_id(tmp_path: Path) -> None:
+    recorder = AOLedgerRecorder(tmp_path / "sess-fallback", "sess-fallback")
+    call = {"tool": "read_file", "arguments": {"path": "a.md", "n": 1}}
+    first = recorder.record_tool_exchange(call, "observed text", None)
+    swapped = {"tool": "read_file", "arguments": {"n": 1, "path": "a.md"}}
+    second = recorder.record_tool_exchange(swapped, "observed text", None)
+    assert first is not None
+    assert second is None
+    assert recorder.ledger.count() == 1
+    assert recorder.duplicate_skip_count == 1
+    assert first.message_ref is not None
+    assert first.message_ref["key_kind"] == "fallback"
+    assert first.message_ref["dedup_key"]
+
+    reloaded = AOLedgerRecorder(tmp_path / "sess-fallback", "sess-fallback")
+    assert reloaded.record_tool_exchange(call, "observed text", None) is None
+    assert reloaded.ledger.count() == 1
+    assert reloaded.duplicate_skip_count == 1
+
+
+def test_unkeyed_exchange_is_rejected(tmp_path: Path) -> None:
+    recorder = AOLedgerRecorder(tmp_path / "sess-nokey", "sess-nokey")
+    with pytest.raises(ValueError, match="dedup key"):
+        recorder.record_tool_exchange({}, None, None)
+    assert recorder.ledger.count() == 0
+    assert not (tmp_path / "sess-nokey" / LEDGER_FILENAME).exists()
+
+
 def test_record_messages_skips_duplicate_message_and_tool_call(tmp_path: Path) -> None:
     recorder = AOLedgerRecorder(tmp_path / "sess-dedup", "sess-dedup")
     tool_msg = Message(

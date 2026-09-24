@@ -25,6 +25,7 @@ from openviking.session.evaluation_orchestrator import (
     AgentProposal,
     EvaluationOrchestrator,
     IllegalTransition,
+    MissingTransitionEvidence,
     NoGainTracker,
     OrchestratorState,
 )
@@ -58,16 +59,25 @@ def _orchestrator(tmp_path, name: str = "loop.json") -> EvaluationOrchestrator:
     )
 
 
+def _with_evidence(event: str, payload: dict | None = None) -> dict:
+    body = dict(payload or {})
+    if event == EVENT_FREEZE_BRIEF and not body.get("brief_envelope_id"):
+        body["brief_envelope_id"] = "brief-1"
+    if event == EVENT_COMMIT_REVISIONS and not body.get("revision_ids") and not body.get("outcome_envelope_id"):
+        body["revision_ids"] = ["rev-1"]
+    return body
+
+
 def _to_next_run(orchestrator: EvaluationOrchestrator) -> None:
     for event in HAPPY_PATH_EVENTS[:-1]:
-        orchestrator.advance(event)
+        orchestrator.advance(event, _with_evidence(event))
 
 
 def test_happy_path_reaches_done(tmp_path) -> None:
     orchestrator = _orchestrator(tmp_path)
     seen = [orchestrator.state]
     for event in HAPPY_PATH_EVENTS:
-        record = orchestrator.advance(event, {"step": event})
+        record = orchestrator.advance(event, _with_evidence(event, {"step": event}))
         seen.append(orchestrator.state)
         assert record.event == event
         assert record.from_state == seen[-2]
@@ -157,9 +167,9 @@ def test_should_stop_each_condition(tmp_path) -> None:
     no_gain.advance(EVENT_MEMORY_RETRIEVE)
     no_gain.advance(EVENT_TASK_RUN)
     no_gain.advance(EVENT_SCORE)
-    no_gain.advance(EVENT_FREEZE_BRIEF)
+    no_gain.advance(EVENT_FREEZE_BRIEF, _with_evidence(EVENT_FREEZE_BRIEF))
     no_gain.advance(EVENT_DIAGNOSIS)
-    no_gain.advance(EVENT_COMMIT_REVISIONS)
+    no_gain.advance(EVENT_COMMIT_REVISIONS, _with_evidence(EVENT_COMMIT_REVISIONS))
     no_gain.advance(EVENT_NEXT_RUN)
     assert no_gain.should_stop({"evidence_refs": ["e1"], "key_judgment": "same"}, tracker) is False
     assert tracker.consecutive == 1
@@ -216,7 +226,7 @@ def test_state_log_roundtrip_is_lossless(tmp_path) -> None:
         EVENT_NEXT_RUN,
     )
     for event in _to_next_run_from_memory:
-        orchestrator.advance(event)
+        orchestrator.advance(event, _with_evidence(event))
     orchestrator.advance(
         EVENT_WAIT_EXTERNAL,
         {
@@ -235,3 +245,55 @@ def test_state_log_roundtrip_is_lossless(tmp_path) -> None:
     assert again.to_dict() == orchestrator.to_dict()
     assert again.proposals[0].to_dict()["proposal"] == {"reason": "later", "n": 1}
     assert isinstance(again.proposals[0], AgentProposal)
+
+
+def test_freeze_and_commit_require_transition_evidence(tmp_path) -> None:
+    orchestrator = _orchestrator(tmp_path)
+    for event in (EVENT_MEMORY_RETRIEVE, EVENT_TASK_RUN, EVENT_SCORE):
+        orchestrator.advance(event)
+    try:
+        orchestrator.advance(EVENT_FREEZE_BRIEF)
+    except MissingTransitionEvidence as exc:
+        assert exc.event == EVENT_FREEZE_BRIEF
+    else:
+        raise AssertionError("expected MissingTransitionEvidence")
+    assert orchestrator.state is OrchestratorState.SCORE
+    assert [event.event for event in orchestrator.events] == [
+        EVENT_MEMORY_RETRIEVE,
+        EVENT_TASK_RUN,
+        EVENT_SCORE,
+    ]
+
+    frozen = orchestrator.advance(EVENT_FREEZE_BRIEF, brief_envelope_id="brief-9")
+    assert frozen.to_state is OrchestratorState.FREEZE_BRIEF
+    assert frozen.evidence == {"brief_envelope_id": "brief-9"}
+    orchestrator.advance(EVENT_DIAGNOSIS)
+    try:
+        orchestrator.advance(EVENT_COMMIT_REVISIONS)
+    except MissingTransitionEvidence as exc:
+        assert exc.event == EVENT_COMMIT_REVISIONS
+    else:
+        raise AssertionError("expected MissingTransitionEvidence")
+    assert orchestrator.state is OrchestratorState.DIAGNOSIS
+    committed = orchestrator.advance(EVENT_COMMIT_REVISIONS, revision_ids=["rev-9", "rev-10"])
+    assert committed.to_state is OrchestratorState.COMMIT_REVISIONS
+    assert committed.evidence == {"revision_ids": ["rev-9", "rev-10"]}
+
+    hooked = EvaluationOrchestrator(
+        tmp_path / "hooks.json",
+        evaluation_id="eval-hooks",
+        clock=MutableClock(),
+        event_id_factory=SequenceIds(),
+        write_hooks={
+            "on_brief_envelope": lambda _body: "brief-hook",
+            "on_revision_commit": lambda _body: "outcome-hook",
+        },
+    )
+    for event in (EVENT_MEMORY_RETRIEVE, EVENT_TASK_RUN, EVENT_SCORE):
+        hooked.advance(event)
+    via_hook = hooked.advance(EVENT_FREEZE_BRIEF)
+    assert via_hook.evidence == {"brief_envelope_id": "brief-hook"}
+    hooked.advance(EVENT_DIAGNOSIS)
+    committed_hook = hooked.advance(EVENT_COMMIT_REVISIONS)
+    assert committed_hook.evidence == {"outcome_envelope_id": "outcome-hook"}
+    assert hooked.state is OrchestratorState.COMMIT_REVISIONS
