@@ -3,16 +3,21 @@
 """Trajectory index service: budgeted async builds of Influence Views.
 
 Workspace queue for post-run indexing (ADR-0010 / Q110). Smaller priority
-values leave first. A session keeps only its highest-priority pending job.
-Over budget or paused, ``process_next`` returns ``SkippedResult`` and does
-not build a view or a projection. With no builder, the service freezes a
-deterministic fallback view and registers it on ``ViewSupersedeIndex``.
+values leave first. A session's pending slot keeps the highest-priority job;
+a lower-priority job for that session is deferred, not discarded, until
+``flush_deferred`` or a later ``enqueue`` promotes it. Over budget or paused,
+``process_next`` returns ``SkippedResult`` and does not build a view or a
+projection. With no builder, the service freezes a deterministic fallback
+view and registers it on ``ViewSupersedeIndex``. When a projection registry
+is injected, registering a new revision withdraws older cards for that
+session and purpose from retrieval.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import threading
 from collections.abc import Callable, Mapping
@@ -21,12 +26,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from openviking.session.influence_projection import ProjectionRegistry
 from openviking.session.influence_view import (
     PURPOSE_POST_RUN_INDEX,
     InfluenceViewRevision,
     ViewSupersedeIndex,
     build_minimal_fallback_view,
 )
+
+logger = logging.getLogger(__name__)
 
 SERVICE_VERSION = 1
 
@@ -280,30 +288,50 @@ class TrajectoryIndexService:
         builder: Builder | None = None,
         fallback_session: FallbackSession | None = None,
         clock: Clock | None = None,
+        projection_registry: ProjectionRegistry | None = None,
     ) -> None:
         if not isinstance(supersede_index, ViewSupersedeIndex):
             raise ValueError("supersede_index must be a ViewSupersedeIndex")
+        if projection_registry is not None and not isinstance(projection_registry, ProjectionRegistry):
+            raise ValueError("projection_registry must be a ProjectionRegistry")
         self.path = Path(path)
         self._supersede = supersede_index
+        self._projection_registry = projection_registry
         self._builder = builder
         self._fallback_session = fallback_session
         self._clock = clock or _utc_now
         self._lock = threading.RLock()
         self._pending: dict[str, IndexJob] = {}
+        self._deferred: dict[str, list[IndexJob]] = {}
         self._build_timestamps: list[str] = []
+        self._warned_missing_projection_registry = False
         self._load()
 
     def enqueue(self, job: IndexJob) -> IndexJob:
-        """Queue ``job``. The same session keeps only the highest-priority job.
+        """Queue ``job``. The pending slot keeps the highest-priority job.
 
         Equal priority replaces the pending job so the latest task run at that
-        priority is the one that will build. A worse priority is ignored.
+        priority is the one that will build. A worse priority is deferred, not
+        dropped. A session with no pending job promotes its deferred job first,
+        so a later enqueue can pick up work that was waiting on a higher priority.
         """
         if not isinstance(job, IndexJob):
             raise ValueError("job must be an IndexJob")
         with self._lock:
+            self._promote_ready_deferred_locked()
             existing = self._pending.get(job.session_id)
-            if existing is not None and existing.priority < job.priority:
+            if existing is None:
+                self._pending[job.session_id] = job
+                self._save_locked()
+                return job
+            if job.priority < existing.priority:
+                self._defer_locked(existing)
+                self._pending[job.session_id] = job
+                self._save_locked()
+                return job
+            if job.priority > existing.priority:
+                self._defer_locked(job)
+                self._save_locked()
                 return existing
             self._pending[job.session_id] = job
             self._save_locked()
@@ -313,11 +341,29 @@ class TrajectoryIndexService:
         with self._lock:
             return tuple(sorted(self._pending.values(), key=_queue_key))
 
+    def deferred_jobs(self) -> tuple[IndexJob, ...]:
+        """Lower-priority jobs held back by a higher-priority pending job."""
+        with self._lock:
+            jobs = [job for bucket in self._deferred.values() for job in bucket]
+            return tuple(sorted(jobs, key=_queue_key))
+
+    def flush_deferred(self) -> tuple[IndexJob, ...]:
+        """Promote deferred jobs whose session has no active pending job."""
+        with self._lock:
+            promoted = self._promote_ready_deferred_locked()
+            if promoted:
+                self._save_locked()
+            return tuple(sorted(promoted, key=_queue_key))
+
     def process_next(self, policy: WorkspacePolicy) -> IndexedResult | SkippedResult:
         """Build the next job, or skip with an explicit empty projection.
 
         ``paused`` and an exhausted window both leave the job queued. They do
-        not call the builder and do not register a revision.
+        not call the builder and do not register a revision. A successful build
+        registers the revision before the queue snapshot. Replaying a pending
+        job whose ``(session_id, purpose, content_hash)`` is already indexed
+        does not append another supersede record. With a projection registry,
+        older cards for that session and purpose leave retrieval.
         """
         if not isinstance(policy, WorkspacePolicy):
             raise ValueError("policy must be a WorkspacePolicy")
@@ -333,7 +379,9 @@ class TrajectoryIndexService:
             if not self._budget_allows_locked(policy):
                 return SkippedResult(reason=SKIP_BUDGET_EXHAUSTED, job_id=nxt.job_id)
             revision = self._build_locked(nxt)
-            self._supersede.register(revision)
+            if not self._content_hash_registered_locked(revision):
+                self._supersede.register(revision)
+            self._sync_projections_locked(revision)
             self._pending.pop(nxt.session_id, None)
             self._build_timestamps.append(_format_dt(_as_utc(self._clock())))
             self._save_locked()
@@ -345,6 +393,7 @@ class TrajectoryIndexService:
             return {
                 "version": SERVICE_VERSION,
                 "jobs": jobs,
+                "deferred": self._deferred_dicts_locked(),
                 "build_timestamps": list(self._build_timestamps),
             }
 
@@ -358,6 +407,7 @@ class TrajectoryIndexService:
         builder: Builder | None = None,
         fallback_session: FallbackSession | None = None,
         clock: Clock | None = None,
+        projection_registry: ProjectionRegistry | None = None,
     ) -> TrajectoryIndexService:
         service = cls(
             path,
@@ -365,9 +415,63 @@ class TrajectoryIndexService:
             builder=builder,
             fallback_session=fallback_session,
             clock=clock,
+            projection_registry=projection_registry,
         )
         service._apply(data, persist=True)
         return service
+
+    def _defer_locked(self, job: IndexJob) -> None:
+        bucket = [
+            item
+            for item in self._deferred.get(job.session_id, [])
+            if item.job_id != job.job_id and item.priority != job.priority
+        ]
+        bucket.append(job)
+        self._deferred[job.session_id] = bucket
+
+    def _promote_ready_deferred_locked(self) -> list[IndexJob]:
+        promoted: list[IndexJob] = []
+        for session_id in sorted(self._deferred):
+            if session_id in self._pending:
+                continue
+            jobs = list(self._deferred.get(session_id) or [])
+            if not jobs:
+                continue
+            best = min(jobs, key=_queue_key)
+            rest = [item for item in jobs if item.job_id != best.job_id]
+            self._pending[session_id] = best
+            promoted.append(best)
+            if rest:
+                self._deferred[session_id] = rest
+            else:
+                del self._deferred[session_id]
+        return promoted
+
+    def _deferred_dicts_locked(self) -> list[dict[str, Any]]:
+        jobs = [job for bucket in self._deferred.values() for job in bucket]
+        jobs.sort(key=_queue_key)
+        return [job.to_dict() for job in jobs]
+
+    def _content_hash_registered_locked(self, revision: InfluenceViewRevision) -> bool:
+        history = self._supersede.history(revision.session_id, revision.purpose)
+        return any(item.content_hash == revision.content_hash for item in history)
+
+    def _sync_projections_locked(self, revision: InfluenceViewRevision) -> None:
+        registry = self._projection_registry
+        if registry is None:
+            if not self._warned_missing_projection_registry:
+                self._warned_missing_projection_registry = True
+                logger.warning(
+                    "projection_registry is not configured; superseded projection cards "
+                    "were not withdrawn from retrieval"
+                )
+            return
+        registry.register(revision)
+        registry.withdraw_superseded(
+            revision.session_id,
+            revision.purpose,
+            revision.revision_id,
+        )
 
     def _select_locked(self) -> IndexJob | None:
         if not self._pending:
@@ -406,6 +510,9 @@ class TrajectoryIndexService:
         jobs_raw = payload.get("jobs")
         if not isinstance(jobs_raw, list):
             raise ValueError("jobs must be a list")
+        deferred_raw = payload.get("deferred", [])
+        if not isinstance(deferred_raw, list):
+            raise ValueError("deferred must be a list")
         stamps = payload.get("build_timestamps")
         if not isinstance(stamps, list):
             raise ValueError("build_timestamps must be a list")
@@ -415,9 +522,24 @@ class TrajectoryIndexService:
             existing = pending.get(job.session_id)
             if existing is None or job.priority <= existing.priority:
                 pending[job.session_id] = job
+        deferred: dict[str, list[IndexJob]] = {}
+        for item in deferred_raw:
+            job = IndexJob.from_dict(_require_mapping(item, "job"))
+            active = pending.get(job.session_id)
+            if active is not None and active.job_id == job.job_id:
+                continue
+            bucket = deferred.setdefault(job.session_id, [])
+            if any(item_job.job_id == job.job_id or item_job.priority == job.priority for item_job in bucket):
+                bucket[:] = [
+                    item_job
+                    for item_job in bucket
+                    if item_job.job_id != job.job_id and item_job.priority != job.priority
+                ]
+            bucket.append(job)
         normalized = [_require_timestamp(stamp, "build_timestamp") for stamp in stamps]
         with self._lock:
             self._pending = pending
+            self._deferred = deferred
             self._build_timestamps = normalized
             if persist:
                 self._save_locked()
@@ -433,6 +555,7 @@ class TrajectoryIndexService:
         body = {
             "version": SERVICE_VERSION,
             "jobs": [job.to_dict() for job in sorted(self._pending.values(), key=_queue_key)],
+            "deferred": self._deferred_dicts_locked(),
             "build_timestamps": list(self._build_timestamps),
         }
         text = json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True)

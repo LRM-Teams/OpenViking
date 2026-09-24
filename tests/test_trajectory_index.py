@@ -5,10 +5,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from openviking.session.influence_projection import (
+    REMOVAL_SUPERSEDED,
+    ProjectionRegistry,
+)
 from openviking.session.influence_view import (
     DETERMINISTIC_FALLBACK_REASON,
     PURPOSE_POST_RUN_INDEX,
@@ -75,13 +80,21 @@ def _revision_for(session_id: str, task_run_id: str, outcome_status: str):
     )
 
 
-def _service(tmp_path, *, builder=None, clock=None, name: str = "queue.json"):
+def _service(
+    tmp_path,
+    *,
+    builder=None,
+    clock=None,
+    name: str = "queue.json",
+    projection_registry=None,
+):
     index = ViewSupersedeIndex(tmp_path / f"{name}.views.json")
     service = TrajectoryIndexService(
         tmp_path / name,
         index,
         builder=builder,
         clock=clock,
+        projection_registry=projection_registry,
     )
     return service, index
 
@@ -263,6 +276,132 @@ def test_state_round_trip_and_reload_preserves_budget(tmp_path) -> None:
     assert isinstance(skipped_again, SkippedResult)
     assert skipped_again.reason == SKIP_BUDGET_EXHAUSTED
     assert index.latest("sess-2", PURPOSE_POST_RUN_INDEX) is None
+
+
+def test_process_next_withdraws_superseded_projection_cards(tmp_path) -> None:
+    registry = ProjectionRegistry(
+        tmp_path / "projections.json",
+        session_acl=lambda _session_id: ("team-a",),
+    )
+    service, _index = _service(tmp_path, builder=_revision_for, projection_registry=registry)
+    policy = WorkspacePolicy(max_builds_per_window=5, window_seconds=60)
+    service.enqueue(
+        _job("job-1", "sess", priority=PRIORITY_SUCCEEDED, outcome_status="succeeded", task_run_id="run-1")
+    )
+    first = service.process_next(policy)
+    assert isinstance(first, IndexedResult)
+    visible = registry.search(principal_labels=("team-a",))
+    assert {card.source_pointer.view_revision_id for card in visible} == {first.revision.revision_id}
+
+    service.enqueue(
+        _job(
+            "job-2",
+            "sess",
+            priority=PRIORITY_SUCCEEDED,
+            outcome_status="succeeded",
+            task_run_id="run-2",
+            enqueued_at=T1,
+        )
+    )
+    second = service.process_next(policy)
+    assert isinstance(second, IndexedResult)
+    visible = registry.search(principal_labels=("team-a",))
+    assert {card.source_pointer.view_revision_id for card in visible} == {second.revision.revision_id}
+    superseded = [
+        record for record in registry.removed_records() if record.reason == REMOVAL_SUPERSEDED
+    ]
+    assert [record.card.source_pointer.view_revision_id for record in superseded] == [
+        first.revision.revision_id
+    ]
+
+
+def test_missing_projection_registry_warns_once_and_still_indexes(tmp_path, caplog) -> None:
+    service, index = _service(tmp_path, builder=_revision_for)
+    policy = WorkspacePolicy(max_builds_per_window=5, window_seconds=60)
+    service.enqueue(
+        _job("job-1", "sess-1", priority=PRIORITY_SUCCEEDED, outcome_status="succeeded")
+    )
+    service.enqueue(
+        _job(
+            "job-2",
+            "sess-2",
+            priority=PRIORITY_FAILED,
+            outcome_status="failed",
+            enqueued_at=T1,
+        )
+    )
+    with caplog.at_level(logging.WARNING):
+        first = service.process_next(policy)
+        second = service.process_next(policy)
+    assert isinstance(first, IndexedResult)
+    assert isinstance(second, IndexedResult)
+    assert index.latest("sess-1", PURPOSE_POST_RUN_INDEX) is not None
+    assert index.latest("sess-2", PURPOSE_POST_RUN_INDEX) is not None
+    warnings = [record for record in caplog.records if "projection_registry" in record.message]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+
+
+def test_replay_same_content_hash_does_not_duplicate_supersede(tmp_path) -> None:
+    service, index = _service(tmp_path, builder=_revision_for)
+    policy = WorkspacePolicy(max_builds_per_window=5, window_seconds=60)
+    job = _job(
+        "job-1",
+        "sess",
+        priority=PRIORITY_SUCCEEDED,
+        outcome_status="succeeded",
+        task_run_id="run-1",
+    )
+    service.enqueue(job)
+    first = service.process_next(policy)
+    assert isinstance(first, IndexedResult)
+    service.enqueue(job)
+    second = service.process_next(policy)
+    assert isinstance(second, IndexedResult)
+    history = index.history("sess", PURPOSE_POST_RUN_INDEX)
+    assert len(history) == 1
+    assert history[0].content_hash == first.revision.content_hash
+    assert second.revision.content_hash == first.revision.content_hash
+
+
+def test_lower_priority_job_stays_deferred_until_flush(tmp_path) -> None:
+    service, index = _service(tmp_path, builder=_revision_for)
+    policy = WorkspacePolicy(max_builds_per_window=5, window_seconds=60)
+    service.enqueue(
+        _job(
+            "job-low",
+            "sess",
+            priority=PRIORITY_SUCCEEDED,
+            outcome_status="succeeded",
+            task_run_id="run-low",
+        )
+    )
+    service.enqueue(
+        _job(
+            "job-high",
+            "sess",
+            priority=PRIORITY_EVALUATION,
+            outcome_status="evaluation",
+            task_run_id="run-high",
+            enqueued_at=T1,
+        )
+    )
+    assert [job.job_id for job in service.pending_jobs()] == ["job-high"]
+    assert [job.job_id for job in service.deferred_jobs()] == ["job-low"]
+    high = service.process_next(policy)
+    assert isinstance(high, IndexedResult)
+    assert high.job.job_id == "job-high"
+    assert [job.job_id for job in service.pending_jobs()] == []
+    assert [job.job_id for job in service.deferred_jobs()] == ["job-low"]
+    promoted = service.flush_deferred()
+    assert [job.job_id for job in promoted] == ["job-low"]
+    low = service.process_next(policy)
+    assert isinstance(low, IndexedResult)
+    assert low.job.job_id == "job-low"
+    assert [item.revision_id for item in index.history("sess", PURPOSE_POST_RUN_INDEX)] == [
+        "rev-run-high",
+        "rev-run-low",
+    ]
 
 
 def test_process_next_empty_queue_raises(tmp_path) -> None:

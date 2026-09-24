@@ -268,3 +268,21 @@ def test_registry_round_trip(tmp_path) -> None:
     restored = ProjectionRegistry.from_dict(payload, path=tmp_path / "copy.json", clock=_clock)
     assert restored.to_dict() == registry.to_dict()
     assert restored.search(principal_labels=("team-a",))[0].status == CARD_STATUS_VERIFIED
+
+
+def test_withdraw_superseded_keeps_named_revision_and_audits_the_rest(tmp_path) -> None:
+    registry = _registry(tmp_path)
+    registry.register(_fallback(SESSION, "rev-1"), acl_labels=("team",))
+    diagnosis = _fallback(SESSION, "rev-diag", purpose=PURPOSE_FAILURE_DIAGNOSIS)
+    registry.register(diagnosis, acl_labels=("team",))
+    kept = registry.withdraw_superseded(SESSION, PURPOSE_POST_RUN_INDEX, "rev-1")
+    assert kept == ()
+    removed = registry.withdraw_superseded(SESSION, PURPOSE_POST_RUN_INDEX, "rev-2")
+    assert [record.reason for record in removed] == [REMOVAL_SUPERSEDED]
+    assert [record.card.source_pointer.view_revision_id for record in removed] == ["rev-1"]
+    assert registry.removed_records() == removed
+    found = registry.search(principal_labels=("team",))
+    assert {card.source_pointer.view_revision_id for card in found} == {"rev-diag"}
+    registry.register(_fallback(SESSION, "rev-2"), acl_labels=("team",))
+    found = registry.search(principal_labels=("team",))
+    assert {card.source_pointer.view_revision_id for card in found} == {"rev-2", "rev-diag"}

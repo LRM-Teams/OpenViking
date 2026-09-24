@@ -476,6 +476,41 @@ class ProjectionRegistry:
                 self._save_locked()
             return removed
 
+    def withdraw_superseded(
+        self,
+        session_id: str,
+        purpose: str,
+        keep_view_revision_id: str,
+    ) -> tuple[RemovalRecord, ...]:
+        """Withdraw active cards for one session and purpose, except the kept revision.
+
+        Cards whose source pointer is ``keep_view_revision_id`` stay searchable.
+        Every other active card for that pair leaves the index with a superseded
+        audit row, the same withdraw-and-audit shape as ``handle_acl_change``.
+        """
+        session = _require_str(session_id, "session_id")
+        purpose_value = _require_str(purpose, "purpose")
+        keep = _require_str(keep_view_revision_id, "keep_view_revision_id")
+        with self._lock:
+            kept_labels: tuple[str, ...] = ()
+            doomed: list[_ActiveEntry] = []
+            for entry in self._entries.values():
+                if entry.card.session_id != session or entry.purpose != purpose_value:
+                    continue
+                if entry.card.source_pointer.view_revision_id == keep:
+                    if not kept_labels:
+                        kept_labels = entry.card.acl_labels
+                    continue
+                doomed.append(entry)
+            doomed.sort(key=lambda entry: entry.card.card_id)
+            removed = tuple(
+                self._withdraw_locked(entry, reason=REMOVAL_SUPERSEDED, new_labels=kept_labels)
+                for entry in doomed
+            )
+            if removed:
+                self._save_locked()
+            return removed
+
     def removed_records(self) -> tuple[RemovalRecord, ...]:
         with self._lock:
             return tuple(self._removed)
