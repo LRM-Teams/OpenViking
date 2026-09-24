@@ -6,6 +6,13 @@ File-level authoritative store for fork nodes (ADR-0001 / ADR-0003, Q25/Q26).
 Directory layout is ``<root>/causal-experiences/``; the URI layer is a later
 slice. Writes are gated by ``is_causal_mode_enabled``. Evaluator / orchestration
 trigger semantics (CONSENSUS #27 / line-28) are deferred to a later slice.
+
+Fork revisions also follow the three-phase lifecycle (ADR-0012): ``draft``
+stays in memory, ``commit_provisional`` is the authoritative accept, and
+``validated`` / ``invalidated`` are append-only superseding revisions.
+``influence_grounding`` snapshots and the intervention-history reverse index
+implement ADR-0010 grounding reachability. Citation counts do not change
+``ForkStatus``.
 """
 
 from __future__ import annotations
@@ -15,6 +22,7 @@ import json
 import os
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +35,9 @@ FORKS_DIRNAME = "forks"
 REVISIONS_DIRNAME = "revisions"
 INDEX_FILENAME = "index.jsonl"
 IDEMPOTENCY_DIRNAME = ".idempotency"
+INTERVENTION_INDEX_FILENAME = "intervention-index.json"
+
+FORK_CANDIDATE_ROLE = "ForkCandidate"
 
 ANCHOR_KIND_AO = "ao"
 ANCHOR_KIND_SESSION_STATE = "session_state"
@@ -57,6 +68,28 @@ CAPTURED_STATES = frozenset(("committed", "live"))
 BRANCH_EVIDENCE_STATUSES = frozenset(
     ("real", "imagined_synthetic", "imagined_unverified")
 )
+
+POSITION_KIND_BLOCK = "block"
+POSITION_KIND_EDGE = "edge"
+POSITION_KIND_CUT = "cut"
+POSITION_KINDS = frozenset(
+    (POSITION_KIND_BLOCK, POSITION_KIND_EDGE, POSITION_KIND_CUT)
+)
+PositionKind = Literal["block", "edge", "cut"]
+
+INDEPENDENT_CONTROL_REF_KIND = "independent_control"
+OBSERVED_BRANCH_EVIDENCE_STATUS = "real"
+
+
+class ForkStatus:
+    """Fork revision lifecycle. No transition reads a citation count."""
+
+    DRAFT = "draft"
+    PROVISIONAL = "provisional"
+    VALIDATED = "validated"
+    INVALIDATED = "invalidated"
+    ALL = frozenset((DRAFT, PROVISIONAL, VALIDATED, INVALIDATED))
+
 
 EvidenceRole = Literal[
     "contemporaneous_basis",
@@ -334,6 +367,78 @@ def _validate_evidence_list(items: Any, field: str) -> list[EvidenceRef]:
     return [validate_evidence_ref(item) for item in items]
 
 
+@dataclass(frozen=True)
+class InfluenceGrounding:
+    """Content-addressed snapshot of a fork's influence-view position (ADR-0010)."""
+
+    view_revision_id: str
+    position_kind: PositionKind
+    position_ref: str
+    semantic_summary_snapshot: str
+    content_hash: str
+    grounded_at: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "view_revision_id", _require_str(self.view_revision_id, "view_revision_id")
+        )
+        kind = self.position_kind
+        if kind not in POSITION_KINDS:
+            raise ValueError(
+                f"position_kind must be one of {sorted(POSITION_KINDS)}, got {kind!r}"
+            )
+        object.__setattr__(self, "position_kind", kind)
+        object.__setattr__(self, "position_ref", _require_str(self.position_ref, "position_ref"))
+        object.__setattr__(
+            self,
+            "semantic_summary_snapshot",
+            _require_str(self.semantic_summary_snapshot, "semantic_summary_snapshot"),
+        )
+        object.__setattr__(self, "content_hash", _require_str(self.content_hash, "content_hash"))
+        object.__setattr__(self, "grounded_at", _require_str(self.grounded_at, "grounded_at"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "view_revision_id": self.view_revision_id,
+            "position_kind": self.position_kind,
+            "position_ref": self.position_ref,
+            "semantic_summary_snapshot": self.semantic_summary_snapshot,
+            "content_hash": self.content_hash,
+            "grounded_at": self.grounded_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> InfluenceGrounding:
+        payload = _require_mapping(data, "influence_grounding")
+        return cls(
+            view_revision_id=str(payload.get("view_revision_id") or ""),
+            position_kind=payload.get("position_kind"),  # type: ignore[arg-type]
+            position_ref=str(payload.get("position_ref") or ""),
+            semantic_summary_snapshot=str(payload.get("semantic_summary_snapshot") or ""),
+            content_hash=str(payload.get("content_hash") or ""),
+            grounded_at=str(payload.get("grounded_at") or ""),
+        )
+
+
+def influence_position_key(grounding: InfluenceGrounding | dict[str, Any]) -> str:
+    """Stable key for one grounded position inside a view revision."""
+    if not isinstance(grounding, InfluenceGrounding):
+        grounding = InfluenceGrounding.from_dict(
+            _require_mapping(grounding, "influence_grounding")
+        )
+    return _canonical_dumps(
+        {"position_kind": grounding.position_kind, "position_ref": grounding.position_ref}
+    )
+
+
+def _coerce_influence_grounding(value: Any) -> InfluenceGrounding | None:
+    if value is None:
+        return None
+    if isinstance(value, InfluenceGrounding):
+        return value
+    return InfluenceGrounding.from_dict(_require_mapping(value, "influence_grounding"))
+
+
 def _hash_fields(
     *,
     fork_node_id: str,
@@ -349,6 +454,9 @@ def _hash_fields(
     diagnosis_run_id: str,
     created_at: str,
     model_version: str,
+    status: str | None = None,
+    influence_grounding: dict[str, Any] | None = None,
+    validation_evidence: dict[str, Any] | None = None,
 ) -> str:
     payload = {
         "fork_node_id": fork_node_id,
@@ -364,6 +472,9 @@ def _hash_fields(
         "diagnosis_run_id": diagnosis_run_id,
         "created_at": created_at,
         "model_version": model_version,
+        "status": status,
+        "influence_grounding": influence_grounding,
+        "validation_evidence": validation_evidence,
     }
     return _sha256_text(_canonical_dumps(payload))
 
@@ -400,6 +511,9 @@ class ForkNodeRevision:
     created_at: str
     content_hash: str
     model_version: str
+    status: str | None = None
+    influence_grounding: InfluenceGrounding | None = None
+    validation_evidence: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "fork_node_id", _require_str(self.fork_node_id, "fork_node_id"))
@@ -431,6 +545,26 @@ class ForkNodeRevision:
         )
         object.__setattr__(self, "used_skills", _validate_used_skills(self.used_skills))
         object.__setattr__(self, "branches", _validate_branches(self.branches))
+        if self.status is None:
+            normalized_status: str | None = None
+        else:
+            normalized_status = _require_str(self.status, "status")
+            if normalized_status not in ForkStatus.ALL:
+                raise ValueError(
+                    f"status must be one of {sorted(ForkStatus.ALL)}, got {normalized_status!r}"
+                )
+        object.__setattr__(self, "status", normalized_status)
+        object.__setattr__(
+            self,
+            "influence_grounding",
+            _coerce_influence_grounding(self.influence_grounding),
+        )
+        evidence = self.validation_evidence
+        if evidence is not None:
+            evidence = json.loads(
+                _canonical_dumps(_require_mapping(evidence, "validation_evidence"))
+            )
+        object.__setattr__(self, "validation_evidence", evidence)
         _check_contemporaneous_isolation(self.anchor, self.contemporaneous_basis)
         expected = self.recompute_content_hash()
         stored = self.content_hash
@@ -457,7 +591,21 @@ class ForkNodeRevision:
             diagnosis_run_id=self.diagnosis_run_id,
             created_at=self.created_at,
             model_version=self.model_version,
+            status=self.status,
+            influence_grounding=(
+                None
+                if self.influence_grounding is None
+                else self.influence_grounding.to_dict()
+            ),
+            validation_evidence=self.validation_evidence,
         )
+
+    @property
+    def consumption_role(self) -> str | None:
+        """Provisional revisions are consumed as ForkCandidate."""
+        if self.status == ForkStatus.PROVISIONAL:
+            return FORK_CANDIDATE_ROLE
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -475,6 +623,13 @@ class ForkNodeRevision:
             "created_at": self.created_at,
             "content_hash": self.content_hash,
             "model_version": self.model_version,
+            "status": self.status,
+            "influence_grounding": (
+                None
+                if self.influence_grounding is None
+                else self.influence_grounding.to_dict()
+            ),
+            "validation_evidence": self.validation_evidence,
         }
 
     @classmethod
@@ -495,7 +650,145 @@ class ForkNodeRevision:
             created_at=str(payload.get("created_at") or ""),
             content_hash=str(payload.get("content_hash") or ""),
             model_version=str(payload.get("model_version") or ""),
+            status=payload.get("status"),
+            influence_grounding=payload.get("influence_grounding"),
+            validation_evidence=payload.get("validation_evidence"),
         )
+
+
+# Authoritative lifecycle object. A provisional ForkRevision is consumed as ForkCandidate.
+ForkRevision = ForkNodeRevision
+
+
+@dataclass(frozen=True)
+class ForkDraft:
+    """In-memory draft. Never written to the authoritative fork store."""
+
+    revision: ForkNodeRevision
+
+    def __post_init__(self) -> None:
+        if self.revision.status != ForkStatus.DRAFT:
+            raise ValueError("ForkDraft requires status=draft")
+
+    @property
+    def status(self) -> str:
+        return ForkStatus.DRAFT
+
+
+@dataclass(frozen=True)
+class ServerChecks:
+    """Attestations required before a draft may enter authoritative storage.
+
+    Schema is enforced by this module. Anchor/ref existence, ACL, and provenance
+    depend on ledger services, so the caller supplies those results. ``acl_hook``
+    is invoked when present.
+    """
+
+    anchor_exists: bool
+    refs_exist: bool
+    provenance_valid: bool
+    acl_allowed: bool = True
+    acl_hook: Callable[[ForkDraft], bool] | None = None
+
+    def failure_reason(self, draft: ForkDraft) -> str | None:
+        if not self.anchor_exists:
+            return "anchor does not exist"
+        if not self.refs_exist:
+            return "referenced evidence does not exist"
+        if self.acl_hook is not None and not self.acl_hook(draft):
+            return "ACL hook denied"
+        if not self.acl_allowed:
+            return "ACL denied"
+        if not self.provenance_valid:
+            return "provenance check failed"
+        return None
+
+
+def _coerce_server_checks(value: ServerChecks | dict[str, Any]) -> ServerChecks:
+    if isinstance(value, ServerChecks):
+        return value
+    payload = _require_mapping(value, "server_checks")
+    hook = payload.get("acl_hook")
+    if hook is not None and not callable(hook):
+        raise ValueError("server_checks.acl_hook must be callable")
+    return ServerChecks(
+        anchor_exists=bool(payload.get("anchor_exists")),
+        refs_exist=bool(payload.get("refs_exist")),
+        provenance_valid=bool(payload.get("provenance_valid")),
+        acl_allowed=bool(payload.get("acl_allowed", True)),
+        acl_hook=hook,
+    )
+
+
+def _require_ref_list(items: Any, field: str) -> list[Any]:
+    if not isinstance(items, list) or not items:
+        raise ValueError(f"validated evidence requires at least one {field}")
+    return items
+
+
+def _normalize_validated_evidence(evidence: Any) -> dict[str, Any]:
+    payload = _require_mapping(evidence, "evidence")
+    observed_in = _require_ref_list(
+        payload.get("observed_branch_refs"), "observed branch ref"
+    )
+    observed: list[dict[str, Any]] = []
+    for index, item in enumerate(observed_in):
+        entry = _require_mapping(item, f"observed_branch_refs[{index}]")
+        if entry.get("evidence_status") != OBSERVED_BRANCH_EVIDENCE_STATUS:
+            continue
+        observed.append(
+            {
+                "branch_id": _require_str(
+                    entry.get("branch_id"), f"observed_branch_refs[{index}].branch_id"
+                ),
+                "evidence_status": OBSERVED_BRANCH_EVIDENCE_STATUS,
+                "ref": _require_optional_str(entry.get("ref"), f"observed_branch_refs[{index}].ref"),
+            }
+        )
+    if not observed:
+        raise ValueError(
+            "validated evidence requires at least one observed branch ref "
+            f"with evidence_status={OBSERVED_BRANCH_EVIDENCE_STATUS!r}"
+        )
+    control_in = _require_ref_list(
+        payload.get("independent_control_refs"), "independent_control ref"
+    )
+    controls: list[dict[str, Any]] = []
+    for index, item in enumerate(control_in):
+        entry = _require_mapping(item, f"independent_control_refs[{index}]")
+        if entry.get("ref_kind") != INDEPENDENT_CONTROL_REF_KIND:
+            continue
+        controls.append(
+            {
+                "ref_kind": INDEPENDENT_CONTROL_REF_KIND,
+                "ref_id": _require_str(
+                    entry.get("ref_id"), f"independent_control_refs[{index}].ref_id"
+                ),
+            }
+        )
+    if not controls:
+        raise ValueError("validated evidence requires at least one independent_control ref")
+    return {
+        "observed_branch_refs": observed,
+        "independent_control_refs": controls,
+    }
+
+
+def _normalize_counter_evidence(counter_evidence: Any) -> dict[str, Any]:
+    payload = _require_mapping(counter_evidence, "counter_evidence")
+    if not payload:
+        raise ValueError("counter_evidence must be a non-empty dict")
+    return json.loads(_canonical_dumps(payload))
+
+
+def _provisional_idempotency_key(revision: ForkNodeRevision) -> str:
+    return _canonical_dumps(
+        {
+            "diagnosis_run_id": revision.diagnosis_run_id,
+            "anchor": canonical_anchor_key(revision.anchor),
+            "content_hash": revision.content_hash,
+        }
+    )
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -567,6 +860,8 @@ class CausalExperiencesStore:
         self._ns = self._root / NAMESPACE_DIRNAME
         self._index_path = self._ns / INDEX_FILENAME
         self._idempotency_dir = self._ns / IDEMPOTENCY_DIRNAME
+        self._intervention_index_path = self._ns / INTERVENTION_INDEX_FILENAME
+        self._drafts: dict[str, ForkDraft] = {}
         self._lock = threading.Lock()
 
     def _require_causal_write(self) -> None:
@@ -641,6 +936,8 @@ class CausalExperiencesStore:
             raise ValueError("payload must be a dict")
         if not isinstance(idempotency_key, str) or not idempotency_key:
             raise ValueError("idempotency_key must be a non-empty str")
+        if payload.get("status") == ForkStatus.DRAFT:
+            raise ValueError("draft status cannot be written to authoritative storage")
 
         incoming = dict(payload)
         payload_hash = _sha256_text(_canonical_dumps(incoming))
@@ -770,3 +1067,216 @@ class CausalExperiencesStore:
         if not isinstance(payload, dict):
             raise ValueError("revision file must contain a JSON object")
         return ForkNodeRevision.from_dict(payload).to_dict()
+
+    def submit_fork_draft(
+        self,
+        payload: dict[str, Any],
+        *,
+        influence_grounding: InfluenceGrounding | dict[str, Any] | None = None,
+    ) -> ForkDraft:
+        """Validate a fork draft in memory. Does not touch authoritative storage."""
+        self._require_causal_write()
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dict")
+        incoming = dict(payload)
+        incoming["status"] = ForkStatus.DRAFT
+        incoming["content_hash"] = ""
+        if influence_grounding is not None:
+            incoming["influence_grounding"] = (
+                influence_grounding.to_dict()
+                if isinstance(influence_grounding, InfluenceGrounding)
+                else influence_grounding
+            )
+        if not incoming.get("fork_node_id"):
+            incoming["fork_node_id"] = str(uuid.uuid4())
+        if not incoming.get("revision_id"):
+            incoming["revision_id"] = str(uuid.uuid4())
+        if not incoming.get("created_at"):
+            incoming["created_at"] = _utc_now_iso()
+        draft = ForkDraft(ForkNodeRevision.from_dict(incoming))
+        with self._lock:
+            self._drafts[draft.revision.revision_id] = draft
+        return draft
+
+    def commit_provisional(
+        self,
+        draft: ForkDraft,
+        server_checks: ServerChecks | dict[str, Any],
+    ) -> ForkRevision:
+        """Persist ``draft`` as a provisional ForkRevision when server checks pass.
+
+        Idempotency key is ``diagnosis_run_id + anchor + content_hash``. The
+        returned object is consumed in the ForkCandidate role.
+        """
+        self._require_causal_write()
+        if not isinstance(draft, ForkDraft):
+            raise ValueError("draft must be a ForkDraft")
+        checks = _coerce_server_checks(server_checks)
+        reason = checks.failure_reason(draft)
+        if reason is not None:
+            raise ValueError(f"server check failed: {reason}")
+        provisional_payload = draft.revision.to_dict()
+        provisional_payload["status"] = ForkStatus.PROVISIONAL
+        provisional_payload["content_hash"] = ""
+        provisional = ForkNodeRevision.from_dict(provisional_payload)
+        result = self.upsert_fork_node(
+            provisional.to_dict(),
+            idempotency_key=_provisional_idempotency_key(provisional),
+        )
+        stored = self.get_revision(result["fork_node_id"], result["revision_id"])
+        if stored is None:
+            raise ValueError("provisional revision missing after commit")
+        revision = ForkNodeRevision.from_dict(stored)
+        self._index_intervention(revision)
+        with self._lock:
+            self._drafts.pop(draft.revision.revision_id, None)
+        return revision
+
+    def append_validated(self, fork_node_id: str, evidence: dict[str, Any]) -> ForkRevision:
+        """Append a validated superseding revision. Does not overwrite history."""
+        self._require_causal_write()
+        normalized = _normalize_validated_evidence(evidence)
+        return self._append_status_revision(
+            fork_node_id, ForkStatus.VALIDATED, normalized
+        )
+
+    def append_invalidated(
+        self, fork_node_id: str, counter_evidence: dict[str, Any]
+    ) -> ForkRevision:
+        """Append an invalidated superseding revision. Does not overwrite history."""
+        self._require_causal_write()
+        normalized = _normalize_counter_evidence(counter_evidence)
+        return self._append_status_revision(
+            fork_node_id, ForkStatus.INVALIDATED, normalized
+        )
+
+    def query_intervention_history(
+        self, view_revision_id: str, position_key: str
+    ) -> list[dict[str, Any]]:
+        """Return intervention-history rows for one grounded position."""
+        view_revision_id = _require_str(view_revision_id, "view_revision_id")
+        position_key = _require_str(position_key, "position_key")
+        with self._lock:
+            rows = self._read_intervention_entries()
+        matched = [
+            _public_intervention_row(row)
+            for row in rows
+            if row.get("view_revision_id") == view_revision_id
+            and row.get("position_key") == position_key
+        ]
+        return matched
+
+    def mark_needs_revalidation(self, view_revision_id: str) -> int:
+        """Flag groundings of ``view_revision_id`` without deleting or rewriting revisions."""
+        self._require_causal_write()
+        view_revision_id = _require_str(view_revision_id, "view_revision_id")
+        with self._lock:
+            rows = self._read_intervention_entries()
+            updated = 0
+            for row in rows:
+                if row.get("view_revision_id") != view_revision_id:
+                    continue
+                if row.get("needs_revalidation") is True:
+                    continue
+                row["needs_revalidation"] = True
+                updated += 1
+            if updated:
+                self._write_intervention_entries(rows)
+            return updated
+
+    def _append_status_revision(
+        self,
+        fork_node_id: str,
+        status: str,
+        validation_evidence: dict[str, Any],
+    ) -> ForkRevision:
+        fork_node_id = _require_str(fork_node_id, "fork_node_id")
+        loaded = self.get_fork_node(fork_node_id)
+        if loaded is None:
+            raise ValueError(f"unknown fork_node_id {fork_node_id!r}")
+        latest = dict(loaded["latest_revision"])
+        payload = {
+            "fork_node_id": fork_node_id,
+            "workspace_id": latest["workspace_id"],
+            "anchor": latest["anchor"],
+            "revision_id": str(uuid.uuid4()),
+            "supersedes_revision_id": latest["revision_id"],
+            "seven_sections": latest["seven_sections"],
+            "contemporaneous_basis": latest["contemporaneous_basis"],
+            "hindsight_attribution": latest["hindsight_attribution"],
+            "used_skills": latest["used_skills"],
+            "branches": latest["branches"],
+            "diagnosis_run_id": latest["diagnosis_run_id"],
+            "created_at": _utc_now_iso(),
+            "model_version": latest["model_version"],
+            "status": status,
+            "influence_grounding": latest.get("influence_grounding"),
+            "validation_evidence": validation_evidence,
+            "content_hash": "",
+        }
+        revision = ForkNodeRevision.from_dict(payload)
+        result = self.upsert_fork_node(
+            revision.to_dict(),
+            idempotency_key=_canonical_dumps(
+                {
+                    "op": status,
+                    "diagnosis_run_id": revision.diagnosis_run_id,
+                    "anchor": canonical_anchor_key(revision.anchor),
+                    "content_hash": revision.content_hash,
+                }
+            ),
+        )
+        stored = self.get_revision(result["fork_node_id"], result["revision_id"])
+        if stored is None:
+            raise ValueError("appended revision missing after write")
+        appended = ForkNodeRevision.from_dict(stored)
+        self._index_intervention(appended)
+        return appended
+
+    def _index_intervention(self, revision: ForkNodeRevision) -> None:
+        grounding = revision.influence_grounding
+        if grounding is None:
+            return
+        entry = {
+            "view_revision_id": grounding.view_revision_id,
+            "position_key": influence_position_key(grounding),
+            "fork_node_id": revision.fork_node_id,
+            "revision_id": revision.revision_id,
+            "validation_status": revision.status,
+            "summary": grounding.semantic_summary_snapshot,
+            "needs_revalidation": False,
+        }
+        with self._lock:
+            rows = self._read_intervention_entries()
+            if any(row.get("revision_id") == revision.revision_id for row in rows):
+                return
+            rows.append(entry)
+            self._write_intervention_entries(rows)
+
+    def _read_intervention_entries(self) -> list[dict[str, Any]]:
+        path = self._intervention_index_path
+        if not path.is_file():
+            return []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(payload, dict):
+            return []
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            return []
+        return [dict(item) for item in entries if isinstance(item, dict)]
+
+    def _write_intervention_entries(self, rows: list[dict[str, Any]]) -> None:
+        _atomic_write_json(self._intervention_index_path, {"entries": rows})
+
+
+def _public_intervention_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "fork_node_id": row.get("fork_node_id"),
+        "revision_id": row.get("revision_id"),
+        "validation_status": row.get("validation_status"),
+        "summary": row.get("summary"),
+        "needs_revalidation": bool(row.get("needs_revalidation")),
+    }
