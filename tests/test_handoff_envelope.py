@@ -13,9 +13,12 @@ from openviking.session.handoff_envelope import (
     HANDOFF_KIND_OUTCOME,
     DiagnosisBrief,
     DiagnosisOutcome,
+    EnvelopeConflict,
     HandoffEnvelope,
     HandoffEnvelopeService,
+    ManifestMismatch,
     content_address,
+    verify_manifest,
 )
 
 T0 = datetime(2026, 9, 24, tzinfo=timezone.utc)
@@ -159,3 +162,95 @@ def test_persistence_roundtrip_is_lossless(tmp_path) -> None:
     assert brief_again.to_dict() == _brief().to_dict()
     outcome_again = DiagnosisOutcome.from_dict(_outcome().to_dict())
     assert outcome_again.to_dict() == _outcome().to_dict()
+
+
+def test_same_key_same_body_returns_original_and_different_body_conflicts(tmp_path) -> None:
+    path = tmp_path / "handoff.json"
+    service = HandoffEnvelopeService(path, clock=MutableClock())
+    brief = _brief("manifest-a")
+    first = service.deliver(brief)
+    second = service.deliver(HandoffEnvelope.from_brief(brief))
+    assert second.envelope_id == first.envelope_id
+    assert len(service.deliveries) == 1
+
+    changed = brief.to_dict()
+    changed["evaluation_id"] = "eval-2"
+    with pytest.raises(EnvelopeConflict, match="iteration"):
+        service.deliver(DiagnosisBrief.from_dict(changed))
+    assert len(service.deliveries) == 1
+    restored = HandoffEnvelopeService(path, clock=MutableClock())
+    assert len(restored.deliveries) == 1
+    assert restored.deliveries[0].envelope_id == first.envelope_id
+
+    moved = dict(changed)
+    moved["iteration_id"] = "iter-2"
+    third = service.deliver(DiagnosisBrief.from_dict(moved))
+    assert third.envelope_id != first.envelope_id
+    assert len(service.deliveries) == 2
+
+
+def test_expanded_credential_names_are_rejected() -> None:
+    rejected = (
+        "password",
+        "bearer",
+        "authorization",
+        "cookie",
+        "apikey",
+        "session",
+        "Password",
+        "Bearer",
+        "Authorization",
+        "Cookie",
+        "ApiKey",
+        "user_session",
+        "password_hash",
+        "token_hash",
+    )
+    for field in rejected:
+        payload = _brief().to_dict()
+        payload["policy_versions"] = {field: "x"}
+        with pytest.raises(ValueError, match="credential"):
+            DiagnosisBrief.from_dict(payload)
+
+
+def test_established_hash_fields_stay_allowed() -> None:
+    envelope = HandoffEnvelope.from_dict(
+        {
+            "handoff_kind": HANDOFF_KIND_BRIEF,
+            "iteration_id": "iter-1",
+            "input_manifest_hash": "manifest-a",
+            "body": {
+                "input_manifest_hash": "manifest-a",
+                "content_hash": "abc",
+                "manifest_hash": "def",
+                "Content_Hash": "ghi",
+                "memory_task_state_hash": "state-hash-1",
+                "input_brief_hash": "brief-hash-1",
+            },
+        }
+    )
+    assert envelope.input_manifest_hash == "manifest-a"
+    assert envelope.body["content_hash"] == "abc"
+    assert envelope.body["manifest_hash"] == "def"
+    assert envelope.body["Content_Hash"] == "ghi"
+    assert envelope.body["memory_task_state_hash"] == "state-hash-1"
+
+
+def test_verify_manifest_accepts_canonical_match_and_rejects_mismatch() -> None:
+    body = {"zeta": 1, "alpha": ["fork:1", "hint:2"]}
+    digest = content_address({"alpha": ["fork:1", "hint:2"], "zeta": 1})
+    envelope = HandoffEnvelope.from_dict(
+        {
+            "handoff_kind": HANDOFF_KIND_BRIEF,
+            "iteration_id": "iter-1",
+            "input_manifest_hash": digest,
+            "body": body,
+        }
+    )
+    verify_manifest(envelope, body)
+    verify_manifest(envelope, envelope.body)
+    with pytest.raises(ManifestMismatch):
+        verify_manifest(envelope, {"alpha": ["fork:1", "hint:2"], "zeta": 2})
+    literal = HandoffEnvelope.from_brief(_brief())
+    with pytest.raises(ManifestMismatch):
+        verify_manifest(literal, _brief().to_dict())

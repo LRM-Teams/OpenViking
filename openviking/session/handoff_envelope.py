@@ -3,9 +3,20 @@
 """Immutable content-addressed handoff envelopes (ADR-0012, Q93-A).
 
 Idempotency key is ``iteration_id + handoff_kind + input_manifest_hash``.
-Delivery is at-least-once: a repeat returns the original result and writes
-nothing new. ``envelope_id`` is ``sha256`` of the canonical JSON document.
-Envelopes carry no credential fields.
+The same key must yield the same result: a repeat whose ``envelope_id``
+matches the stored delivery returns that result and writes nothing new.
+The same key with a different body raises ``EnvelopeConflict``; create a
+new iteration instead. ``envelope_id`` is ``sha256`` of the canonical
+JSON document. ``input_manifest_hash`` is supplied by the caller;
+``verify_manifest`` checks it against the canonical JSON hash of the body.
+
+Envelopes carry no credential fields. Names are matched case-insensitively
+as substrings of token, secret, key, credential, password, bearer,
+authorization, cookie, apikey, and session. Established fields that end
+with ``_hash`` are an exact allowlist: ``input_manifest_hash``,
+``content_hash``, ``manifest_hash``, ``input_brief_hash``, and
+``memory_task_state_hash``. Any other name containing a forbidden
+substring is rejected, including names that merely contain ``hash``.
 """
 
 from __future__ import annotations
@@ -26,9 +37,39 @@ HANDOFF_KIND_BRIEF = "brief"
 HANDOFF_KIND_OUTCOME = "outcome"
 HANDOFF_KINDS = frozenset({HANDOFF_KIND_BRIEF, HANDOFF_KIND_OUTCOME})
 
-_FORBIDDEN_NAME_PARTS = ("token", "secret", "key", "credential")
+_FORBIDDEN_NAME_PARTS = (
+    "token",
+    "secret",
+    "key",
+    "credential",
+    "password",
+    "bearer",
+    "authorization",
+    "cookie",
+    "apikey",
+    "session",
+)
+
+# Exact names, not a "contains hash" exemption. Each entry ends with ``_hash``.
+_ALLOWED_HASH_FIELDS = frozenset(
+    {
+        "content_hash",
+        "input_brief_hash",
+        "input_manifest_hash",
+        "manifest_hash",
+        "memory_task_state_hash",
+    }
+)
 
 Clock = Callable[[], datetime]
+
+
+class EnvelopeConflict(ValueError):
+    """Same idempotency key was reused with a different envelope body."""
+
+
+class ManifestMismatch(ValueError):
+    """``input_manifest_hash`` does not match the canonical hash of the body."""
 
 
 def _utc_now() -> datetime:
@@ -60,8 +101,15 @@ def _canonical_dumps(value: Any) -> str:
 
 
 def _is_credential_name(name: str) -> bool:
+    """Return whether ``name`` looks like a credential field.
+
+    Matching is a case-insensitive substring against
+    ``_FORBIDDEN_NAME_PARTS``. ``_ALLOWED_HASH_FIELDS`` is an exact
+    allowlist of established ``*_hash`` names. A name that merely
+    contains ``hash`` is not exempt.
+    """
     lowered = name.lower()
-    if "hash" in lowered:
+    if lowered in _ALLOWED_HASH_FIELDS:
         return False
     return any(part in lowered for part in _FORBIDDEN_NAME_PARTS)
 
@@ -122,6 +170,26 @@ def content_address(document: Mapping[str, Any]) -> str:
 
 def idempotency_key(iteration_id: str, handoff_kind: str, input_manifest_hash: str) -> str:
     return f"{iteration_id}\x1f{handoff_kind}\x1f{input_manifest_hash}"
+
+
+def verify_manifest(envelope: HandoffEnvelope, body: Mapping[str, Any]) -> None:
+    """Check ``input_manifest_hash`` against the canonical JSON hash of ``body``.
+
+    The digest is ``sha256`` of canonical JSON (sorted keys, compact
+    separators), the same encoding as ``content_address``. A match returns.
+    A mismatch raises ``ManifestMismatch``. Callers that supply
+    ``input_manifest_hash`` can self-check immediately after construction.
+    The hash is still caller-supplied; delivery does not recompute it.
+    """
+    if not isinstance(envelope, HandoffEnvelope):
+        raise TypeError("envelope must be a HandoffEnvelope")
+    if not isinstance(body, Mapping):
+        raise ValueError("body must be a mapping")
+    digest = content_address(_thaw(body))
+    if digest != envelope.input_manifest_hash:
+        raise ManifestMismatch(
+            "input_manifest_hash does not match the canonical JSON hash of the body"
+        )
 
 
 @dataclass(frozen=True)
@@ -410,7 +478,12 @@ class AckRecord:
 
 
 class HandoffEnvelopeService:
-    """In-process delivery log. The idempotency key collapses repeat delivers."""
+    """In-process delivery log.
+
+    The same idempotency key returns the original delivery when
+    ``envelope_id`` matches. A different body under that key raises
+    ``EnvelopeConflict``.
+    """
 
     def __init__(self, path: str | Path | None = None, *, clock: Clock | None = None) -> None:
         self._path = _resolve_store_path(path) if path is not None else None
@@ -438,12 +511,23 @@ class HandoffEnvelopeService:
         iteration_id: str | None = None,
         input_manifest_hash: str | None = None,
     ) -> DeliveryResult:
-        """Deliver once per idempotency key. A repeat returns the first result."""
+        """Deliver once per idempotency key.
+
+        A repeat with the same ``envelope_id`` returns the first result.
+        A repeat with a different body raises ``EnvelopeConflict``.
+        """
         with self._lock:
             sealed = self._seal(envelope, iteration_id=iteration_id, input_manifest_hash=input_manifest_hash)
             key = idempotency_key(sealed.iteration_id, sealed.handoff_kind, sealed.input_manifest_hash)
             existing = self._by_key.get(key)
             if existing is not None:
+                if existing.envelope_id != sealed.envelope_id:
+                    raise EnvelopeConflict(
+                        "same idempotency key with a different body "
+                        f"(stored envelope_id {existing.envelope_id}, "
+                        f"new envelope_id {sealed.envelope_id}); "
+                        "create a new iteration"
+                    )
                 return existing
             delivered_at = sealed.delivered_at or _format_dt(self._clock())
             stored = HandoffEnvelope(
