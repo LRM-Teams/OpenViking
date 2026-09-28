@@ -13,6 +13,7 @@ import json
 import threading
 import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,8 +34,18 @@ _SKILL_INVOCATION_BUFFER_LIMIT = 64
 _TOOL_CALL_ID_KEYS = ("tool_call_id", "tool_id")
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _format_dt(value: datetime) -> str:
+    return _as_utc(value).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _clip_text(value: str, limit: int) -> str:
@@ -328,9 +339,16 @@ class AOAttribution:
 class AOLedger:
     """Per-session append-only AO ledger persisted as ``ao-ledger.jsonl``."""
 
-    def __init__(self, session_dir: Path, session_id: str) -> None:
+    def __init__(
+        self,
+        session_dir: Path,
+        session_id: str,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self._session_dir = Path(session_dir)
         self._session_id = session_id
+        self._clock = clock or _utc_now
         self._path = self._session_dir / LEDGER_FILENAME
         self._lock = threading.Lock()
         self._records: list[AORecord] = []
@@ -390,7 +408,7 @@ class AOLedger:
                 observation=stored_observation,
                 skill_invocations=stored_skills,
                 message_ref=stored_ref,
-                created_at=_utc_now_iso(),
+                created_at=_format_dt(self._clock()),
                 captured_state=CAPTURED_STATE_LIVE,
             )
             line = json.dumps(record.to_dict(), ensure_ascii=False) + "\n"

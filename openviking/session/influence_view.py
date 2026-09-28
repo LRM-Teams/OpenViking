@@ -15,6 +15,7 @@ import hashlib
 import json
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,8 +49,18 @@ ConstructionMode = Literal["adaptive", "fallback"]
 Severity = Literal["high", "low"]
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _format_dt(value: datetime) -> str:
+    return _as_utc(value).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _canonical_dumps(value: Any) -> str:
@@ -694,6 +705,7 @@ class InfluenceViewDraft:
         claims: Sequence[InfluenceClaim] | None = None,
         critic_rounds: int = 0,
         patch_provenance: Sequence[CriticPatchRecord] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.view_id = _require_str(view_id, "view_id")
         self.purpose = _require_choice(purpose, "purpose", PURPOSES)
@@ -717,6 +729,7 @@ class InfluenceViewDraft:
             if not isinstance(record, CriticPatchRecord):
                 raise ValueError("patch_provenance must contain CriticPatchRecord")
             self.patch_provenance.append(record)
+        self._clock = clock or _utc_now
 
     def _ensure_editable(self) -> None:
         if self.critic_rounds >= MAX_CRITIC_ROUNDS:
@@ -819,7 +832,7 @@ class InfluenceViewDraft:
         caller should switch to ``build_minimal_fallback_view``.
         """
         mode = _require_choice(construction_mode, "construction_mode", CONSTRUCTION_MODES)
-        stamp = _utc_now_iso() if frozen_at is None else _require_str(frozen_at, "frozen_at")
+        stamp = _format_dt(self._clock()) if frozen_at is None else _require_str(frozen_at, "frozen_at")
         identity = revision_id or uuid.uuid4().hex
         if not isinstance(enforce_checks, bool):
             raise ValueError("enforce_checks must be a bool")
@@ -859,7 +872,9 @@ class InfluenceViewDraft:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> InfluenceViewDraft:
+    def from_dict(
+        cls, data: dict[str, Any], *, clock: Callable[[], datetime] | None = None
+    ) -> InfluenceViewDraft:
         payload = _require_mapping(data, "draft")
         return cls(
             view_id=_require_str(payload.get("view_id"), "view_id"),
@@ -882,6 +897,7 @@ class InfluenceViewDraft:
                 CriticPatchRecord.from_dict(_require_mapping(item, "patch"))
                 for item in payload.get("patch_provenance") or []
             ),
+            clock=clock,
         )
 
 
@@ -1370,7 +1386,11 @@ def _with_diagnosis_root_sink(
     return [root, *blocks, sink], tuple(links)
 
 
-def build_minimal_fallback_view(session: Mapping[str, Any]) -> InfluenceViewRevision:
+def build_minimal_fallback_view(
+    session: Mapping[str, Any],
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> InfluenceViewRevision:
     """One block per segment over the given AO interval.
 
     Segment blocks use ``granularity_reason=deterministic_fallback``. A
@@ -1468,6 +1488,7 @@ def build_minimal_fallback_view(session: Mapping[str, Any]) -> InfluenceViewRevi
         coverage=coverage,
         blocks=tuple(blocks),
         claims=claims,
+        clock=clock,
     )
     frozen_at = payload.get("frozen_at")
     revision_id = payload.get("revision_id")

@@ -63,8 +63,18 @@ class QuotaExceeded(Exception):
         )
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _format_dt(value: datetime) -> str:
+    return _as_utc(value).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _canonical_dumps(value: Any) -> str:
@@ -618,6 +628,7 @@ class CausalBridgeStore:
         per_node_active_cap: int = PER_NODE_ACTIVE_CAP,
         per_run_write_quota: int = PER_RUN_WRITE_QUOTA,
         score_fn: ScoreFn | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._root = Path(root)
         self._config = config
@@ -632,6 +643,7 @@ class CausalBridgeStore:
         if score_fn is not None and not callable(score_fn):
             raise ValueError("score_fn must be callable")
         self._score_fn = score_fn
+        self._clock = clock or _utc_now
         self._lock = threading.Lock()
         self._bridges: dict[str, BridgeRecord] = {}
         self._by_key: dict[str, str] = {}
@@ -640,6 +652,9 @@ class CausalBridgeStore:
         self._run_counts: dict[str, int] = {}
         self.skipped_line_count = 0
         self._load()
+
+    def _now_iso(self) -> str:
+        return _format_dt(self._clock())
 
     def _require_causal_write(self) -> None:
         if not is_causal_mode_enabled(self._config):
@@ -832,7 +847,7 @@ class CausalBridgeStore:
             if direct_relevance is None
             else _require_number(direct_relevance, "direct_relevance")
         )
-        when = _require_str(timestamp, "timestamp") if timestamp is not None else _utc_now_iso()
+        when = _require_str(timestamp, "timestamp") if timestamp is not None else self._now_iso()
         jid = _require_str(judgment_id, "judgment_id") if judgment_id is not None else str(uuid.uuid4())
         labels = None if security_labels is None else _security_labels_from(security_labels)
         key = canonical_bridge_key(source, target, relation)
@@ -961,7 +976,7 @@ class CausalBridgeStore:
         if not acl_valid:
             raise ValueError("reactivation requires a valid ACL")
         bid = _require_str(bridge_id, "bridge_id")
-        when = _require_str(at, "at") if at is not None else _utc_now_iso()
+        when = _require_str(at, "at") if at is not None else self._now_iso()
 
         with self._lock:
             bridge = self._bridges.get(bid)

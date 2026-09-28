@@ -165,8 +165,18 @@ _INTERACTION_EDGE_REQUIRED = (
 )
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _format_dt(value: datetime) -> str:
+    return _as_utc(value).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _canonical_dumps(value: Any) -> str:
@@ -1254,8 +1264,8 @@ def _security_labels_of(row: dict[str, Any]) -> frozenset[str]:
     return frozenset(labels)
 
 
-def _quarantine_intervention_index(path: Path) -> Path:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+def _quarantine_intervention_index(path: Path, clock: Callable[[], datetime]) -> Path:
+    stamp = _as_utc(clock()).strftime("%Y%m%dT%H%M%S%fZ")
     dest = path.with_name(f"{path.name}.corrupt-{stamp}")
     os.replace(path, dest)
     return dest
@@ -1324,15 +1334,25 @@ def _order_revisions(by_id: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
 class CausalExperiencesStore:
     """File-level causal-experiences store keyed at ``<root>/causal-experiences/``."""
 
-    def __init__(self, root: str | Path, config: Any = None) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        config: Any = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self._root = Path(root)
         self._config = config
+        self._clock = clock or _utc_now
         self._ns = self._root / NAMESPACE_DIRNAME
         self._index_path = self._ns / INDEX_FILENAME
         self._idempotency_dir = self._ns / IDEMPOTENCY_DIRNAME
         self._intervention_index_path = self._ns / INTERVENTION_INDEX_FILENAME
         self._drafts: dict[str, ForkDraft] = {}
         self._lock = threading.Lock()
+
+    def _now_iso(self) -> str:
+        return _format_dt(self._clock())
 
     def _require_causal_write(self) -> None:
         if not is_causal_mode_enabled(self._config):
@@ -1476,7 +1496,7 @@ class CausalExperiencesStore:
             revision_id = incoming.get("revision_id") or str(uuid.uuid4())
             revision_id = _require_str(revision_id, "revision_id")
 
-            created_at = incoming.get("created_at") or _utc_now_iso()
+            created_at = incoming.get("created_at") or self._now_iso()
             draft = dict(incoming)
             draft["fork_node_id"] = fork_node_id
             draft["revision_id"] = revision_id
@@ -1621,7 +1641,7 @@ class CausalExperiencesStore:
         if not incoming.get("revision_id"):
             incoming["revision_id"] = str(uuid.uuid4())
         if not incoming.get("created_at"):
-            incoming["created_at"] = _utc_now_iso()
+            incoming["created_at"] = self._now_iso()
         draft = ForkDraft(ForkNodeRevision.from_dict(incoming))
         with self._lock:
             self._drafts[draft.revision.revision_id] = draft
@@ -1770,7 +1790,7 @@ class CausalExperiencesStore:
             "used_skills": latest["used_skills"],
             "branches": latest["branches"],
             "diagnosis_run_id": latest["diagnosis_run_id"],
-            "created_at": _utc_now_iso(),
+            "created_at": self._now_iso(),
             "model_version": latest["model_version"],
             "status": status,
             "influence_grounding": latest.get("influence_grounding"),
@@ -1839,7 +1859,7 @@ class CausalExperiencesStore:
 
     def _raise_corrupt_intervention_index(self, path: Path, exc: BaseException) -> None:
         try:
-            quarantined = _quarantine_intervention_index(path)
+            quarantined = _quarantine_intervention_index(path, self._clock)
         except OSError:
             logger.error("intervention index unreadable and could not be quarantined: %s", path)
             raise InterventionIndexCorruptError(

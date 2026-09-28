@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -415,3 +417,67 @@ def test_corrupt_jsonl_line_is_skipped_and_store_stays_usable(
     third = _judge(reloaded, index=3, run_id="run-3", relevance=4.0, judgment_id="j-good-3")
     assert reloaded.get_bridge(third.bridge_id) == third
     assert len(reloaded.list_bridges(_PRINCIPAL)) == 3
+
+
+def test_injected_clock_stamps_persisted_judgment_and_reactivation(tmp_path: Path) -> None:
+    fixed = datetime(2026, 3, 4, 5, 6, 7, 890000, tzinfo=timezone.utc)
+    expected = "2026-03-04T05:06:07.890Z"
+    store = _store(tmp_path, per_node_active_cap=1, clock=lambda: fixed)
+    store.record_judgment(
+        run_id="run-keep",
+        source_ref=_SOURCE,
+        target_ref=_target(1),
+        relation_type="explores",
+        relevance=10.0,
+        timestamp="2026-01-01T00:00:00.000Z",
+        judgment_id="j-keep",
+        direct_relevance=10.0,
+        security_labels=_PRINCIPAL,
+    )
+    dormant = store.record_judgment(
+        run_id="run-clock",
+        source_ref=_SOURCE,
+        target_ref=_target(2),
+        relation_type="explores",
+        relevance=1.0,
+        judgment_id="j-clock",
+        direct_relevance=1.0,
+        security_labels=_PRINCIPAL,
+    )
+    assert dormant.status == "inactive"
+    assert dormant.created_at == expected
+    assert store.judgments_for(dormant.bridge_id)[0].timestamp == expected
+
+    restored = store.reactivate(
+        dormant.bridge_id,
+        "direct_relevance_recheck",
+        direct_relevance=50.0,
+    )
+    assert restored.status == "reactivated"
+    assert restored.status_events[-1].at == expected
+
+    events = [
+        json.loads(line)
+        for line in _events_path(tmp_path).read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    clock_judgment = next(
+        event
+        for event in events
+        if event.get("event_type") == "judgment_commit"
+        and event["judgment"]["judgment_id"] == "j-clock"
+    )
+    assert clock_judgment["judgment"]["timestamp"] == expected
+    clock_bridge = next(
+        bridge
+        for bridge in clock_judgment["bridges"]
+        if bridge["bridge_id"] == dormant.bridge_id
+    )
+    assert clock_bridge["created_at"] == expected
+
+    reloaded = _store(tmp_path)
+    stored = reloaded.get_bridge(dormant.bridge_id)
+    assert stored is not None
+    assert stored.created_at == expected
+    assert stored.status == "reactivated"
+    assert stored.status_events[-1].at == expected

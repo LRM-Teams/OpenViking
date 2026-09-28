@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,8 +42,18 @@ _CONTENT_KEYS = ("content", "output", "tool_output", "text")
 logger = get_logger(__name__)
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _format_dt(value: datetime) -> str:
+    return _as_utc(value).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _read_attribution_ao_ids(path: Path) -> set[str]:
@@ -82,7 +93,12 @@ def collect_attributed_ao_ids(session_dir: Path | str) -> set[str]:
     return attributed
 
 
-def write_archive_attribution(session_dir: Path | str, archive_dir: Path | str) -> int:
+def write_archive_attribution(
+    session_dir: Path | str,
+    archive_dir: Path | str,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> int:
     """Attribute every still-unattributed AO record to ``archive_dir``.
 
     Never rewrites ``ao-ledger.jsonl``. Returns the number of new attribution
@@ -97,13 +113,14 @@ def write_archive_attribution(session_dir: Path | str, archive_dir: Path | str) 
     attributed = collect_attributed_ao_ids(session_path)
     attributed.update(_read_attribution_ao_ids(archive_path / ATTRIBUTION_FILENAME))
 
-    ledger = AOLedger(session_path, session_path.name)
+    resolved_clock = clock or _utc_now
+    ledger = AOLedger(session_path, session_path.name, clock=resolved_clock)
     pending = [record for record in ledger.records() if record.ao_id not in attributed]
     if not pending:
         return 0
 
     archive_id = archive_path.name
-    attributed_at = _utc_now_iso()
+    attributed_at = _format_dt(resolved_clock())
     commit_watermark = f"{archive_id}@{attributed_at}"
     archive_path.mkdir(parents=True, exist_ok=True)
     dest = archive_path / ATTRIBUTION_FILENAME
@@ -304,10 +321,17 @@ def _get_or_create_recorder(session: Any) -> AOLedgerRecorder | None:
 class AOLedgerRecorder:
     """Per-session live capture of tool call / result pairs into ``AOLedger``."""
 
-    def __init__(self, session_dir: Path | str, session_id: str) -> None:
+    def __init__(
+        self,
+        session_dir: Path | str,
+        session_id: str,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.session_id = session_id
         self.session_dir = Path(session_dir)
-        self.ledger = AOLedger(self.session_dir, session_id)
+        self._clock = clock or _utc_now
+        self.ledger = AOLedger(self.session_dir, session_id, clock=self._clock)
         self.duplicate_skip_count = 0
         self._seen_exchange_keys: set[tuple[str, ...]] = set()
         self._dedup_lock = threading.Lock()

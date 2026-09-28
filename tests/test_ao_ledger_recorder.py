@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -405,3 +406,25 @@ async def test_session_commit_seam_causal_vs_legacy(
     await _commit_once(causal=False, root=legacy_root)
     assert not (legacy_root / LEDGER_FILENAME).exists()
     assert not (legacy_root / "history" / "archive_001" / ATTRIBUTION_FILENAME).exists()
+
+
+def test_injected_clock_stamps_recorded_exchange_and_attribution(tmp_path: Path) -> None:
+    fixed = datetime(2026, 5, 6, 7, 8, 9, 123000, tzinfo=timezone.utc)
+    expected = "2026-05-06T07:08:09.123Z"
+    session_dir = tmp_path / "sess-clock"
+    recorder = AOLedgerRecorder(session_dir, "sess-clock", clock=lambda: fixed)
+    record = recorder.record_tool_exchange(
+        _tool_call(path="a.md"),
+        {"ok": True},
+        {"message_id": "m-clock", "tool_call_id": "tc-clock"},
+    )
+    assert record is not None
+    assert record.created_at == expected
+    line = json.loads((session_dir / LEDGER_FILENAME).read_text(encoding="utf-8").strip())
+    assert line["created_at"] == expected
+
+    archive = session_dir / "history" / "archive_clock"
+    assert write_archive_attribution(session_dir, archive, clock=lambda: fixed) == 1
+    attr = json.loads((archive / ATTRIBUTION_FILENAME).read_text(encoding="utf-8").strip())
+    assert attr["attributed_at"] == expected
+    assert attr["commit_watermark"] == f"archive_clock@{expected}"

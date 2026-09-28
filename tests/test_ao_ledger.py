@@ -8,12 +8,14 @@ from __future__ import annotations
 import json
 import threading
 from dataclasses import FrozenInstanceError, fields
+from datetime import datetime, timezone
 from pathlib import Path
 
 from openviking.session.ao_ledger import (
     AOAttribution,
     AOLedger,
     AORecord,
+    LEDGER_FILENAME,
     build_observation,
     extract_skill_invocations,
 )
@@ -154,3 +156,16 @@ def test_skill_invocations_default_to_empty_list_and_are_serialized(tmp_path: Pa
     assert "skill_invocations" in payload
     assert payload["skill_invocations"] == []
     assert json.loads(json.dumps(payload))["skill_invocations"] == []
+
+
+def test_injected_clock_stamps_persisted_created_at(tmp_path: Path) -> None:
+    fixed = datetime(2026, 4, 5, 6, 7, 8, 901000, tzinfo=timezone.utc)
+    expected = "2026-04-05T06:07:08.901Z"
+    session_dir = tmp_path / "sess-clock"
+    ledger = AOLedger(session_dir, "sess-clock", clock=lambda: fixed)
+    record = ledger.append(_action(), _observation())
+    assert record.created_at == expected
+    line = json.loads((session_dir / LEDGER_FILENAME).read_text(encoding="utf-8").strip())
+    assert line["created_at"] == expected
+    reloaded = AOLedger(session_dir, "sess-clock")
+    assert reloaded.records()[0].created_at == expected

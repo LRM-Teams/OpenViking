@@ -5,16 +5,19 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from openviking.session.causal_experiences import (
+    INTERVENTION_INDEX_FILENAME,
     NAMESPACE_DIRNAME,
     SEVEN_SECTION_KEYS,
     CausalExperiencesStore,
     EvidenceRef,
     ForkNodeRevision,
+    InterventionIndexCorruptError,
     canonical_anchor_key,
     validate_anchor,
     validate_evidence_ref,
@@ -395,3 +398,38 @@ def test_evidence_ref_nine_fields_roundtrip() -> None:
     assert validate_evidence_ref(ref) is ref
     with pytest.raises(ValueError, match="evidence_role"):
         validate_evidence_ref({**raw, "evidence_role": "unknown"})
+
+
+def test_injected_clock_stamps_persisted_created_at_and_quarantine(tmp_path: Path) -> None:
+    fixed = datetime(2026, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc)
+    expected = "2026-01-02T03:04:05.678Z"
+    store = CausalExperiencesStore(tmp_path, _CAUSAL_CONFIG, clock=lambda: fixed)
+    payload = _payload()
+    payload.pop("created_at")
+    written = store.upsert_fork_node(payload, idempotency_key="clock-run")
+    revision_path = (
+        tmp_path
+        / NAMESPACE_DIRNAME
+        / "forks"
+        / written["fork_node_id"]
+        / "revisions"
+        / f"{written['revision_id']}.json"
+    )
+    assert json.loads(revision_path.read_text(encoding="utf-8"))["created_at"] == expected
+    index_row = json.loads(
+        (tmp_path / NAMESPACE_DIRNAME / "index.jsonl").read_text(encoding="utf-8").strip()
+    )
+    assert index_row["created_at"] == expected
+    reloaded = _store(tmp_path)
+    stored = reloaded.get_revision(written["fork_node_id"], written["revision_id"])
+    assert stored is not None
+    assert stored["created_at"] == expected
+
+    index = tmp_path / NAMESPACE_DIRNAME / INTERVENTION_INDEX_FILENAME
+    index.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(InterventionIndexCorruptError):
+        store.query_intervention_history("view-1", "pos-1", ["ws-1"])
+    quarantined = list(index.parent.glob(f"{INTERVENTION_INDEX_FILENAME}.corrupt-*"))
+    assert [path.name for path in quarantined] == [
+        f"{INTERVENTION_INDEX_FILENAME}.corrupt-20260102T030405678901Z"
+    ]

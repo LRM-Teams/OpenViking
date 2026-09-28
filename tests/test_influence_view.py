@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -113,6 +115,7 @@ def _draft(
     *,
     purpose: str = "post_run_index",
     omitted: tuple[OmittedRange, ...] = (),
+    clock=None,
 ) -> InfluenceViewDraft:
     return InfluenceViewDraft(
         view_id="view-1",
@@ -122,6 +125,7 @@ def _draft(
         coverage=_coverage(blocks, omitted=omitted),
         blocks=blocks,
         claims=claims or [],
+        clock=clock,
     )
 
 
@@ -505,3 +509,46 @@ def test_failure_diagnosis_fallback_freezes_with_synthetic_root_and_sink() -> No
     assert {block.role for block in revision.blocks} >= {"task", "agent_action", "conclusion"}
     again = build_minimal_fallback_view(session)
     assert again.content_hash == revision.content_hash
+
+
+def test_injected_clock_stamps_persisted_frozen_at(tmp_path: Path) -> None:
+    fixed = datetime(2026, 1, 2, 3, 4, 5, 678000, tzinfo=timezone.utc)
+    expected = "2026-01-02T03:04:05.678Z"
+
+    def clock() -> datetime:
+        return fixed
+
+    draft = _draft([_block("b1", [1, 2])], clock=clock)
+    restored = InfluenceViewDraft.from_dict(draft.to_dict(), clock=clock)
+    revision = restored.freeze()
+    assert revision.frozen_at == expected
+
+    index_path = tmp_path / "influence-view-index.json"
+    ViewSupersedeIndex(index_path).register(revision)
+    loaded = ViewSupersedeIndex(index_path).latest(SESSION, "post_run_index")
+    assert loaded is not None
+    assert loaded.frozen_at == expected
+    raw = json.loads(index_path.read_text(encoding="utf-8"))
+    assert raw["keys"][0]["revisions"][0]["frozen_at"] == expected
+
+    fallback = build_minimal_fallback_view(
+        {
+            "session_id": SESSION,
+            "task_run_id": TASK,
+            "purpose": "post_run_index",
+            "snapshot_watermark": "wm-fallback",
+            "view_id": "view-fb-clock",
+            "revision_id": "rev-fb-clock",
+            "ao_records": [
+                {
+                    "ao_id": "ao-1",
+                    "sequence": 1,
+                    "participant_id": "agent-a",
+                    "segment_id": "seg-a",
+                    "content_hash": "hash-1",
+                }
+            ],
+        },
+        clock=clock,
+    )
+    assert fallback.frozen_at == expected
