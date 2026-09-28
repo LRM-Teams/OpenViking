@@ -6,6 +6,10 @@ The orchestrator exclusively owns the evaluation-loop transitions. Memory and
 diagnosis agents may only submit trigger or schedule proposals; a proposal is
 never a legal transition event. The state log is append-only and persisted as
 JSON.
+
+One iteration shares five worker seats. Independent diagnosis reservations
+stay at or below three. A full pool fails at once with the current holders
+instead of waiting.
 """
 
 from __future__ import annotations
@@ -56,6 +60,8 @@ _PROPOSAL_EVENTS = frozenset(
 )
 
 NO_GAIN_LIMIT = 2
+WORKER_SEAT_TOTAL = 5
+DIAGNOSIS_SEAT_LIMIT = 3
 
 Clock = Callable[[], datetime]
 IdFactory = Callable[[], str]
@@ -428,6 +434,158 @@ class AgentProposal:
         )
 
 
+@dataclass(frozen=True)
+class SeatHold:
+    """One held seat: holder, acquisition time, and purpose label."""
+
+    seat_id: str
+    holder: str
+    acquired_at: str
+    purpose: str
+    diagnosis: bool = False
+
+    def __post_init__(self) -> None:
+        _require_str(self.seat_id, "seat_id")
+        _require_str(self.holder, "holder")
+        _require_str(self.purpose, "purpose")
+        _parse_dt(self.acquired_at)
+
+
+class NoSeatError(Exception):
+    """Raised when a seat cannot be granted. Carries the holders at refusal."""
+
+    def __init__(self, holders: Iterable[SeatHold], *, requested: int, reason: str) -> None:
+        self.holders = tuple(holders)
+        self.requested = requested
+        self.reason = reason
+        listing = ", ".join(f"{item.holder}:{item.purpose}" for item in self.holders) or "(none)"
+        super().__init__(f"{reason}: requested {requested}, holders [{listing}]")
+
+
+class SeatLease:
+    """Pairs one ``acquire`` with ``release``. Also usable as a context manager."""
+
+    def __init__(self, pool: WorkerSeatPool, hold: SeatHold) -> None:
+        self._pool = pool
+        self._hold = hold
+        self._released = False
+
+    @property
+    def hold(self) -> SeatHold:
+        return self._hold
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def release(self) -> None:
+        self._pool.release(self)
+
+    def __enter__(self) -> SeatLease:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if not self._released:
+            self.release()
+
+
+class WorkerSeatPool:
+    """Deterministic seat ledger. No locks and no waiting.
+
+    Interaction, sub-diagnosis, and explorer work share ``total`` seats.
+    ``reserve_diagnosis`` grants a batch only when ``n`` is within the
+    diagnosis cap and within the seats free at that moment, counting seats
+    already held for diagnosis. Timestamps use the injected ``clock``.
+    """
+
+    def __init__(
+        self,
+        *,
+        total: int = WORKER_SEAT_TOTAL,
+        diagnosis_limit: int = DIAGNOSIS_SEAT_LIMIT,
+        clock: Clock | None = None,
+    ) -> None:
+        if isinstance(total, bool) or not isinstance(total, int) or total < 1:
+            raise ValueError("total must be a positive int")
+        if (
+            isinstance(diagnosis_limit, bool)
+            or not isinstance(diagnosis_limit, int)
+            or diagnosis_limit < 0
+        ):
+            raise ValueError("diagnosis_limit must be a non-negative int")
+        if diagnosis_limit > total:
+            raise ValueError("diagnosis_limit cannot exceed total")
+        self._total = total
+        self._diagnosis_limit = diagnosis_limit
+        self._clock = clock or _utc_now
+        self._held: list[SeatHold] = []
+        self._seq = 0
+
+    @property
+    def total(self) -> int:
+        return self._total
+
+    @property
+    def diagnosis_limit(self) -> int:
+        return self._diagnosis_limit
+
+    @property
+    def free(self) -> int:
+        return self._total - len(self._held)
+
+    def acquire(self, holder: str, purpose: str) -> SeatLease:
+        """Take one seat, or raise ``NoSeatError`` with the current holders."""
+        holder_name = _require_str(holder, "holder")
+        purpose_label = _require_str(purpose, "purpose")
+        if len(self._held) >= self._total:
+            raise NoSeatError(self.held_snapshot(), requested=1, reason="pool_full")
+        return self._grant(holder_name, purpose_label, diagnosis=False)
+
+    def reserve_diagnosis(self, n: int, holder: str, purpose: str) -> tuple[SeatLease, ...]:
+        """Grant ``n`` diagnosis seats, or raise ``NoSeatError`` without granting any."""
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise ValueError("n must be a positive int")
+        holder_name = _require_str(holder, "holder")
+        purpose_label = _require_str(purpose, "purpose")
+        diagnosis_held = sum(1 for item in self._held if item.diagnosis)
+        if n > self._diagnosis_limit or diagnosis_held + n > self._diagnosis_limit:
+            raise NoSeatError(self.held_snapshot(), requested=n, reason="diagnosis_batch")
+        if n > self.free:
+            raise NoSeatError(self.held_snapshot(), requested=n, reason="insufficient_free")
+        return tuple(self._grant(holder_name, purpose_label, diagnosis=True) for _ in range(n))
+
+    def release(self, lease: SeatLease) -> None:
+        """Return a seat granted by this pool. A second release is unpaired."""
+        if lease._pool is not self:
+            raise ValueError("lease does not belong to this pool")
+        if lease._released:
+            raise ValueError("seat release is not paired with an active acquire")
+        index = next(
+            (pos for pos, item in enumerate(self._held) if item.seat_id == lease._hold.seat_id),
+            None,
+        )
+        if index is None:
+            raise ValueError("seat release is not paired with an active acquire")
+        lease._released = True
+        del self._held[index]
+
+    def held_snapshot(self) -> tuple[SeatHold, ...]:
+        """Seats still held, in acquisition order, for audit and leak checks."""
+        return tuple(self._held)
+
+    def _grant(self, holder: str, purpose: str, *, diagnosis: bool) -> SeatLease:
+        self._seq += 1
+        hold = SeatHold(
+            seat_id=f"seat-{self._seq}",
+            holder=holder,
+            acquired_at=_format_dt(self._clock()),
+            purpose=purpose,
+            diagnosis=diagnosis,
+        )
+        self._held.append(hold)
+        return SeatLease(self, hold)
+
+
 def _coerce_iteration(value: IterationResult | Mapping[str, Any]) -> IterationResult:
     if isinstance(value, IterationResult):
         return value
@@ -447,7 +605,8 @@ class EvaluationOrchestrator:
     """In-process evaluation loop plus a JSON state log.
 
     ``advance`` is the only transition API. Agent proposals are stored beside
-    the log and are rejected if passed to ``advance``.
+    the log and are rejected if passed to ``advance``. ``seats`` is the shared
+    five-worker pool; when omitted, the orchestrator builds one on its clock.
     """
 
     def __init__(
@@ -458,11 +617,21 @@ class EvaluationOrchestrator:
         clock: Clock | None = None,
         event_id_factory: IdFactory | None = None,
         write_hooks: Mapping[str, Callable[..., Any]] | None = None,
+        seats: WorkerSeatPool | None = None,
     ) -> None:
         self._path = _resolve_store_path(path) if path is not None else None
         self._clock = clock or _utc_now
         self._ids = event_id_factory or (lambda: uuid.uuid4().hex)
         self._write_hooks = dict(write_hooks) if write_hooks else {}
+        self._seats = (
+            seats
+            if seats is not None
+            else WorkerSeatPool(
+                total=WORKER_SEAT_TOTAL,
+                diagnosis_limit=DIAGNOSIS_SEAT_LIMIT,
+                clock=self._clock,
+            )
+        )
         self._lock = threading.Lock()
         self._evaluation_id = _require_str(evaluation_id, "evaluation_id") if evaluation_id else uuid.uuid4().hex
         self._state = OrchestratorState.CREATED
@@ -497,6 +666,10 @@ class EvaluationOrchestrator:
     def satisfied_conditions(self) -> tuple[str, ...]:
         return tuple(self._satisfied_conditions)
 
+    @property
+    def seats(self) -> WorkerSeatPool:
+        return self._seats
+
     def advance(
         self,
         event: Any,
@@ -505,6 +678,7 @@ class EvaluationOrchestrator:
         brief_envelope_id: str | None = None,
         revision_ids: Iterable[str] | None = None,
         outcome_envelope_id: str | None = None,
+        diagnosis_batch: int | None = None,
     ) -> StateEvent:
         """Move one step. Illegal events, including any proposal, raise.
 
@@ -514,7 +688,10 @@ class EvaluationOrchestrator:
         ``on_brief_envelope`` or ``on_revision_commit``, the hook runs before
         the transition and its returned id is stored on the event ``evidence``
         field beside ``payload_hash``. Missing evidence raises
-        ``MissingTransitionEvidence`` and does not move state.
+        ``MissingTransitionEvidence`` and does not move state. Entering
+        ``DIAGNOSIS`` with ``diagnosis_batch`` above the diagnosis seat limit
+        raises ``NoSeatError`` and does not move state. That check sits beside
+        the transition-evidence guard and does not replace it.
         """
         with self._lock:
             self._reject_if_proposal(event)
@@ -532,6 +709,7 @@ class EvaluationOrchestrator:
                 revision_ids=revision_ids,
                 outcome_envelope_id=outcome_envelope_id,
             )
+            self._guard_diagnosis_batch(target, body, diagnosis_batch)
             if target is OrchestratorState.WAITING_EXTERNAL:
                 conditions = _coerce_conditions(body)
             else:
@@ -606,12 +784,14 @@ class EvaluationOrchestrator:
         path: str | Path | None = None,
         clock: Clock | None = None,
         event_id_factory: IdFactory | None = None,
+        seats: WorkerSeatPool | None = None,
     ) -> EvaluationOrchestrator:
         orchestrator = cls(
             path=None,
             evaluation_id=_require_str(data["evaluation_id"], "evaluation_id"),
             clock=clock,
             event_id_factory=event_id_factory,
+            seats=seats,
         )
         orchestrator._state = OrchestratorState(_require_str(data["state"], "state"))
         orchestrator._events = [StateEvent.from_dict(item) for item in data.get("events", [])]
@@ -686,6 +866,33 @@ class EvaluationOrchestrator:
                 evidence["outcome_envelope_id"] = outcome_id
             return evidence
         return {}
+
+    def _guard_diagnosis_batch(
+        self,
+        target: OrchestratorState,
+        body: Mapping[str, Any],
+        diagnosis_batch: int | None,
+    ) -> None:
+        """Refuse a diagnosis entry whose declared batch exceeds the seat cap.
+
+        Absent batch means the caller did not declare one. Evidence requirements
+        stay in ``_transition_evidence`` and still run before this check.
+        """
+        if target is not OrchestratorState.DIAGNOSIS:
+            return
+        raw = diagnosis_batch if diagnosis_batch is not None else body.get("diagnosis_batch")
+        if raw is None:
+            return
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError("diagnosis_batch must be an int")
+        if raw < 0:
+            raise ValueError("diagnosis_batch must be >= 0")
+        if raw > self._seats.diagnosis_limit:
+            raise NoSeatError(
+                self._seats.held_snapshot(),
+                requested=raw,
+                reason="diagnosis_batch",
+            )
 
     def _reject_if_proposal(self, event: Any) -> None:
         if isinstance(event, AgentProposal):

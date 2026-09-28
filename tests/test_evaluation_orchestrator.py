@@ -27,7 +27,9 @@ from openviking.session.evaluation_orchestrator import (
     IllegalTransition,
     MissingTransitionEvidence,
     NoGainTracker,
+    NoSeatError,
     OrchestratorState,
+    WorkerSeatPool,
 )
 
 T0 = datetime(2026, 9, 24, tzinfo=timezone.utc)
@@ -297,3 +299,123 @@ def test_freeze_and_commit_require_transition_evidence(tmp_path) -> None:
     committed_hook = hooked.advance(EVENT_COMMIT_REVISIONS)
     assert committed_hook.evidence == {"outcome_envelope_id": "outcome-hook"}
     assert hooked.state is OrchestratorState.COMMIT_REVISIONS
+
+
+def test_worker_seats_reject_when_full_and_reuse_after_release() -> None:
+    clock = MutableClock()
+    pool = WorkerSeatPool(clock=clock)
+    leases = []
+    for index in range(5):
+        clock.current = datetime(2026, 9, 24, 0, index, tzinfo=timezone.utc)
+        leases.append(pool.acquire(f"holder-{index}", f"explorer-{index}"))
+    assert [(item.holder, item.purpose, item.acquired_at) for item in pool.held_snapshot()] == [
+        (f"holder-{index}", f"explorer-{index}", f"2026-09-24T00:0{index}:00.000Z") for index in range(5)
+    ]
+    try:
+        pool.acquire("holder-5", "explorer")
+    except NoSeatError as exc:
+        assert [(item.holder, item.purpose) for item in exc.holders] == [
+            (f"holder-{index}", f"explorer-{index}") for index in range(5)
+        ]
+        assert exc.requested == 1
+        assert exc.reason == "pool_full"
+    else:
+        raise AssertionError("expected NoSeatError")
+    assert len(pool.held_snapshot()) == 5
+
+    leases[0].release()
+    assert [item.holder for item in pool.held_snapshot()] == [f"holder-{index}" for index in range(1, 5)]
+    again = pool.acquire("holder-reuse", "explorer")
+    assert [item.holder for item in pool.held_snapshot()][-1] == "holder-reuse"
+    again.release()
+    assert all(item.holder != "holder-reuse" for item in pool.held_snapshot())
+
+    with pool.acquire("holder-cm", "reader") as lease:
+        assert lease.hold.holder == "holder-cm"
+        assert lease.hold.purpose == "reader"
+        assert any(item.holder == "holder-cm" for item in pool.held_snapshot())
+    assert all(item.holder != "holder-cm" for item in pool.held_snapshot())
+
+
+def test_diagnosis_batch_above_three_or_free_seats_is_rejected() -> None:
+    pool = WorkerSeatPool(clock=MutableClock())
+    try:
+        pool.reserve_diagnosis(4, "diagnosis", "sub-diagnosis")
+    except NoSeatError as exc:
+        assert exc.requested == 4
+        assert exc.reason == "diagnosis_batch"
+        assert exc.holders == ()
+    else:
+        raise AssertionError("expected NoSeatError")
+    assert pool.held_snapshot() == ()
+
+    busy = [pool.acquire(f"path-{index}", "interaction") for index in range(4)]
+    try:
+        pool.reserve_diagnosis(2, "diagnosis", "sub-diagnosis")
+    except NoSeatError as exc:
+        assert exc.requested == 2
+        assert exc.reason == "insufficient_free"
+        assert len(exc.holders) == 4
+    else:
+        raise AssertionError("expected NoSeatError")
+    assert len(pool.held_snapshot()) == 4
+    for lease in busy:
+        lease.release()
+
+    granted = pool.reserve_diagnosis(3, "diagnosis", "sub-diagnosis")
+    assert len(granted) == 3
+    assert [item.purpose for item in pool.held_snapshot()] == ["sub-diagnosis"] * 3
+    assert all(item.diagnosis for item in pool.held_snapshot())
+    try:
+        pool.reserve_diagnosis(1, "diagnosis", "sub-diagnosis")
+    except NoSeatError as exc:
+        assert exc.reason == "diagnosis_batch"
+        assert len(exc.holders) == 3
+    else:
+        raise AssertionError("expected NoSeatError")
+    for lease in granted:
+        lease.release()
+    assert pool.held_snapshot() == ()
+
+
+def test_entering_diagnosis_rejects_batch_above_three(tmp_path) -> None:
+    clock = MutableClock()
+    pool = WorkerSeatPool(clock=clock)
+    orchestrator = EvaluationOrchestrator(
+        tmp_path / "diag.json",
+        evaluation_id="eval-diag",
+        clock=clock,
+        event_id_factory=SequenceIds(),
+        seats=pool,
+    )
+    assert orchestrator.seats is pool
+    for event in (EVENT_MEMORY_RETRIEVE, EVENT_TASK_RUN, EVENT_SCORE, EVENT_FREEZE_BRIEF):
+        orchestrator.advance(event, _with_evidence(event))
+    held = pool.acquire("explorer", "explore")
+    try:
+        orchestrator.advance(EVENT_DIAGNOSIS, {"diagnosis_batch": 4})
+    except NoSeatError as exc:
+        assert exc.requested == 4
+        assert exc.reason == "diagnosis_batch"
+        assert [item.holder for item in exc.holders] == ["explorer"]
+    else:
+        raise AssertionError("expected NoSeatError")
+    assert orchestrator.state is OrchestratorState.FREEZE_BRIEF
+    assert [event.event for event in orchestrator.events] == [
+        EVENT_MEMORY_RETRIEVE,
+        EVENT_TASK_RUN,
+        EVENT_SCORE,
+        EVENT_FREEZE_BRIEF,
+    ]
+    held.release()
+    moved = orchestrator.advance(EVENT_DIAGNOSIS, {"diagnosis_batch": 3})
+    assert moved.to_state is OrchestratorState.DIAGNOSIS
+    assert orchestrator.seats.held_snapshot() == ()
+
+    plain = _orchestrator(tmp_path, "default-seats.json")
+    assert plain.seats.total == 5
+    assert plain.seats.diagnosis_limit == 3
+    lease = plain.seats.acquire("reader", "freeze")
+    assert lease.hold.acquired_at == "2026-09-24T00:00:00.000Z"
+    lease.release()
+    assert plain.seats.held_snapshot() == ()
