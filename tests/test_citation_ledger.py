@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from dataclasses import FrozenInstanceError, fields
@@ -326,3 +327,24 @@ def test_offline_counts_warn_once(tmp_path: Path, caplog: pytest.LogCaptureFixtu
     warnings = [record.message for record in caplog.records if record.levelno == logging.WARNING]
     assert sum("count_index_exposures" in message for message in warnings) == 1
     assert sum("bridge_citation_count" in message for message in warnings) == 1
+
+
+def test_fsync_on_append_reloads_complete_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fsync_calls: list[int] = []
+    monkeypatch.setattr(citation_ledger_module.os, "fsync", lambda fd: fsync_calls.append(fd))
+    assert (
+        inspect.signature(CitationLedger.__init__).parameters["fsync_on_append"].default is True
+    )
+
+    batch = 4
+    for enabled in (True, False):
+        path = tmp_path / f"fsync-{enabled}.jsonl"
+        ledger = CitationLedger(path, clock=MutableClock(T0), fsync_on_append=enabled)
+        before = len(fsync_calls)
+        for index in range(batch):
+            _cite(ledger, task_id=f"task-{index}")
+        assert len(fsync_calls) - before == (batch if enabled else 0)
+        reloaded = CitationLedger(path, clock=MutableClock(T0))
+        assert len(reloaded.events(require_admin=True)) == batch

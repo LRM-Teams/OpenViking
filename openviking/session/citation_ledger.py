@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import uuid
 from collections.abc import Callable, Iterable, Mapping
@@ -274,9 +275,11 @@ class CitationLedger:
         path: str | Path,
         *,
         clock: Callable[[], datetime] | None = None,
+        fsync_on_append: bool = True,
     ) -> None:
         self._path = _resolve_ledger_path(Path(path))
         self._clock = clock or _utc_now
+        self._fsync_on_append = fsync_on_append
         self._lock = threading.Lock()
         self._events: list[CitationEvent] = []
         self._by_id: dict[str, CitationEvent] = {}
@@ -541,6 +544,8 @@ class CitationLedger:
             with self._path.open("a", encoding="utf-8") as handle:
                 handle.write(line)
                 handle.flush()
+                if self._fsync_on_append:
+                    os.fsync(handle.fileno())
             self._events.append(event)
             self._by_id[event.event_id] = event
             return event
