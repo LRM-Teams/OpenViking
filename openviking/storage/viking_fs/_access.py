@@ -24,6 +24,8 @@ from openviking.storage.acl import (
     AclEntry,
     AclLevel,
     AclMode,
+    AclSpec,
+    AclUpdate,
     acl_allows,
     acl_ancestors,
     has_implicit_manage,
@@ -31,9 +33,10 @@ from openviking.storage.acl import (
     normalize_acl_level,
     normalize_acl_principal,
 )
-from openviking.storage.internal_names import STORAGE_INTERNAL_ENTRY_NAMES
+from openviking.storage.internal_names import is_storage_internal_name
 from openviking_cli.exceptions import (
     FailedPreconditionError,
+    InvalidArgumentError,
     NotFoundError,
     PermissionDeniedError,
 )
@@ -53,7 +56,7 @@ class _AccessMixin:
 
     # First path segments that the Rust git enumerate.rs prunes from snapshots,
     # plus the runtime lock name. Mirrors INTERNAL_FIRST_SEGMENTS in
-    # crates/ragfs/src/git/enumerate.rs and VikingFS._INTERNAL_NAMES so that
+    # crates/ragfs/src/git/enumerate.rs so that
     # callers fail fast in Python with a clear error rather than passing a
     # path that the Rust side will silently drop.
     _GIT_INTERNAL_FIRST_SEGMENTS = frozenset(
@@ -95,6 +98,14 @@ class _AccessMixin:
             return ctx
         bound = self._bound_ctx.get()
         return bound or self._default_ctx()
+
+    def _require_request_context(self, ctx: Optional[RequestContext]) -> RequestContext:
+        """Resolve an account context without inventing the default account."""
+        if ctx is None and self._bound_ctx.get() is None:
+            raise RuntimeError(
+                "Account request context is required for account-scoped operations"
+            )
+        return self._ctx_or_default(ctx)
 
     @contextmanager
     def bind_request_context(self, ctx: RequestContext):
@@ -195,11 +206,7 @@ class _AccessMixin:
 
         effective = await acl_manager.resolve_many(pending, real_ctx) if pending else {}
         for uri in pending:
-            acl = effective[uri]
-            if not acl.enabled:
-                result[uri] = self._is_accessible(uri, real_ctx)
-            else:
-                result[uri] = acl_allows(acl, real_ctx, action)
+            result[uri] = acl_allows(effective[uri], real_ctx, action)
         return result
 
     async def _ensure_access(
@@ -278,9 +285,10 @@ class _AccessMixin:
         acl_ancestors(uri)
         if has_implicit_manage(real_ctx, uri):
             return real_ctx
-        effective = await self.acl_manager.resolve(uri, real_ctx)
-        if effective.enabled and acl_allows(effective, real_ctx, AclAction.MANAGE):
-            return real_ctx
+        if await self.acl_manager.is_enabled(real_ctx.account_id):
+            effective = await self.acl_manager.resolve(uri, real_ctx)
+            if acl_allows(effective, real_ctx, AclAction.MANAGE):
+                return real_ctx
         raise PermissionDeniedError(f"ACL management denied for {uri}", resource=uri)
 
     async def _ensure_acl_target_exists(self, uri: str, ctx: RequestContext) -> bool:
@@ -313,6 +321,19 @@ class _AccessMixin:
         await self._ensure_acl_target_exists(uri, real_ctx)
         effective = await self.acl_manager.resolve(uri, real_ctx)
         return self.acl_manager.to_report(uri, effective)
+
+    async def prepare_acl_update(
+        self,
+        uri: str,
+        acl: AclSpec | Mapping[str, Any],
+        ctx: RequestContext,
+    ) -> AclUpdate:
+        """Authorize an explicit ACL against the permissions before the write."""
+        spec = AclSpec.model_validate(acl)
+        if len(acl_ancestors(uri)) == 1:
+            raise InvalidArgumentError("ACL cannot be set on viking://resources")
+        await self._ensure_acl_manage(uri, ctx)
+        return AclUpdate(uri=uri, acl=spec)
 
     async def set_acl(
         self,
@@ -445,7 +466,7 @@ class _AccessMixin:
         parts = [p for p in parent_path.strip("/").split("/") if p]
         if len(parts) == 2 and parts[0] == "local":
             return name in VikingURI.LISTABLE_SCOPES
-        return name not in STORAGE_INTERNAL_ENTRY_NAMES
+        return not is_storage_internal_name(name)
 
     def _ancestor_is_filtered(self, entry_path: str, base_path: str) -> bool:
         """Check if any ancestor directory of entry_path would be filtered by _ls_entries.

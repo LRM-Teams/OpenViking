@@ -319,6 +319,10 @@ def create_app(
         """Application lifespan handler."""
         nonlocal service
         _configure_default_executor(config)
+        if config.observability.metrics.enabled:
+            from openviking.metrics.core.runtime import install_executor_monitor
+
+            install_executor_monitor()
         owns_service = service is None
         if owns_service:
             service = OpenVikingService()
@@ -386,6 +390,10 @@ def create_app(
 
         await shutdown_usage_audit(app=app)
         await shutdown_metrics_async(app=app)
+        if config.observability.metrics.enabled:
+            from openviking.metrics.core.runtime import uninstall_executor_monitor
+
+            uninstall_executor_monitor()
         task_tracker.stop_cleanup_loop()
         auth_plugin_state = getattr(app.state, "auth_plugin", None)
         if auth_plugin_state is not None:
@@ -777,9 +785,9 @@ def create_app(
     else:
         logger.info("Web Studio bundle not found at %s; skipping /studio mount", _studio_dir)
 
-    # MCP endpoint — serves 15 tools (find, search, read, write, edit,
-    # list, tree, remember, add_resource, list_watches, cancel_watch, grep,
-    # glob, forget, health) via streamable HTTP for MCP clients.
+    # MCP endpoint — serves 16 tools (find, search, read, write, edit,
+    # list, tree, remember, add_resource, add_skill, list_watches, cancel_watch,
+    # grep, glob, forget, health) via streamable HTTP for MCP clients.
     from starlette.routing import Match, Route
 
     from openviking.server.mcp_endpoint import create_mcp_app

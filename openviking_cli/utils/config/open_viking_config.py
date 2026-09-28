@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
@@ -14,7 +15,11 @@ from openviking_cli.session.user_id import UserIdentifier
 from .agent_evolution_config import AgentEvolutionConfig
 from .cache_config import CacheConfig
 from .config_loader import resolve_config_path
-from .config_utils import format_validation_error
+from .config_utils import (
+    format_validation_error,
+    warn_unknown_config_fields,
+    warn_unknown_fields,
+)
 from .consts import (
     DEFAULT_CONFIG_DIR,
     DEFAULT_OV_CONF,
@@ -67,12 +72,26 @@ class ConnectorConfig(BaseModel):
     enable: bool = False
     connector: str = ""
     tracker: str = ""
+    auth: str = ""
     timeout_seconds: int = 3600
     poll_interval_ms: int = 5000
     allowed_add_types: List[str] = Field(default_factory=lambda: ["tos"])
 
     @model_validator(mode="after")
     def _validate(self) -> "ConnectorConfig":
+        self.auth = self.auth.strip()
+        if self.auth:
+            url = urlsplit(self.auth)
+            if (
+                url.scheme not in {"http", "https"}
+                or not url.hostname
+                or url.username
+                or url.password
+                or url.fragment
+            ):
+                raise ValueError(
+                    "connector.auth must be an HTTP(S) endpoint URL without credentials or fragment"
+                )
         if self.enable:
             for name, url in (("connector", self.connector), ("tracker", self.tracker)):
                 if not url.strip():
@@ -477,6 +496,13 @@ class OpenVikingConfig(BaseModel):
                 "webfeed",
             ]
 
+            warn_unknown_config_fields(
+                data=config_copy,
+                model=cls,
+                extra_valid_fields={"server", "bot", "parsers"},
+                logger=_get_config_logger(),
+            )
+
             # Remove sections managed by other loaders (e.g. server config)
             config_copy.pop("server", None)
             config_copy.pop("bot", None)
@@ -496,6 +522,12 @@ class OpenVikingConfig(BaseModel):
                         "Config field 'parsers.excel' was removed and is ignored; "
                         "spreadsheet parsing now uses 'parsers.anydoc'."
                     )
+                warn_unknown_fields(
+                    data=parser_configs,
+                    valid_fields=set(parser_types),
+                    path_prefix="parsers",
+                    logger=_get_config_logger(),
+                )
             for parser_type in parser_types:
                 if parser_type in config_copy:
                     parser_configs[parser_type] = config_copy.pop(parser_type)
@@ -534,6 +566,13 @@ class OpenVikingConfig(BaseModel):
                 if parser_type in parser_configs:
                     parser_data = parser_configs[parser_type]
                     config_class = getattr(instance, parser_type).__class__
+                    if isinstance(parser_data, dict):
+                        warn_unknown_fields(
+                            data=parser_data,
+                            valid_fields=set(config_class.__dataclass_fields__),
+                            path_prefix=f"parsers.{parser_type}",
+                            logger=_get_config_logger(),
+                        )
                     setattr(instance, parser_type, config_class.from_dict(parser_data))
 
             # Check dimension consistency
@@ -542,6 +581,7 @@ class OpenVikingConfig(BaseModel):
                 and getattr(instance.storage, "vectordb", None)
                 and getattr(instance, "embedding", None)
             ):
+                instance.storage.vectordb.apply_resolved_dimension(instance.embedding.dimension)
                 db_dim = instance.storage.vectordb.dimension
                 emb_dim = instance.embedding.dimension
                 if db_dim > 0 and emb_dim > 0 and db_dim != emb_dim:
@@ -780,9 +820,7 @@ def initialize_openviking_config(
         config.storage.agfs.path = resolved
         config.storage.vectordb.path = resolved
 
-    # Ensure vector dimension is synced if not set in storage
-    if config.storage.vectordb.dimension == 0:
-        config.storage.vectordb.dimension = config.embedding.dimension
+    config.storage.vectordb.apply_resolved_dimension(config.embedding.dimension)
 
     # Validate configuration
     if not is_valid_openviking_config(config):
