@@ -339,3 +339,166 @@ def test_silence_records_exposure_without_expecting_disposition(tmp_path: Path) 
     assert service.dispositions("h1") == ()
     assert service.pending_count("task-1", "agent-1") == 0
     assert service.state("h1") == "pending"
+
+
+def test_lineages_do_not_share_cooldown_or_pending_cap(tmp_path: Path) -> None:
+    service, ledger, clock = _service(tmp_path)
+    service.deliver(
+        _hint("a1", sources=[_source(ref="a1")]),
+        clock,
+        task_lineage_id="lineage-a",
+    )
+    service.deliver(
+        _hint("b1", sources=[_source(ref="b1")]),
+        clock,
+        task_lineage_id="lineage-b",
+    )
+    clock.current = T0 + timedelta(seconds=100)
+    with pytest.raises(CooldownActive) as cooled:
+        service.deliver(
+            _hint("a-soon", sources=[_source(ref="a-soon")]),
+            clock,
+            task_lineage_id="lineage-a",
+        )
+    assert cooled.value.remaining_seconds == pytest.approx(200.0)
+    assert cooled.value.task_lineage_id == "lineage-a"
+
+    clock.current = T0 + timedelta(seconds=300)
+    service.deliver(
+        _hint("a2", sources=[_source(ref="a2")]),
+        clock,
+        task_lineage_id="lineage-a",
+    )
+    clock.current = T0 + timedelta(seconds=600)
+    with pytest.raises(PendingCapExceeded) as capped:
+        service.deliver(
+            _hint("a3", sources=[_source(ref="a3")]),
+            clock,
+            task_lineage_id="lineage-a",
+        )
+    assert capped.value.cap == 2
+    assert capped.value.task_lineage_id == "lineage-a"
+    other = service.deliver(
+        _hint("b2", sources=[_source(ref="b2")]),
+        clock,
+        task_lineage_id="lineage-b",
+    )
+    assert other.hint_id == "b2"
+    assert service.pending_count("task-1", "agent-1", "lineage-a") == 2
+    assert service.pending_count("task-1", "agent-1", "lineage-b") == 2
+    assert service.pending_count("task-1", "agent-1") == 0
+    assert len(_exposures(ledger)) == 4
+
+
+def test_star_bucket_matches_omitted_lineage(tmp_path: Path) -> None:
+    service, ledger, clock = _service(tmp_path)
+    sources = [_source(ref="fork-9")]
+    original = service.deliver(_hint("h1", sources=sources, ttl=T0 + timedelta(minutes=10)), clock)
+    clock.current = T0 + timedelta(seconds=20)
+    refreshed = service.deliver(
+        _hint("h-new", sources=list(reversed(sources)), ttl=T0 + timedelta(hours=2)),
+        clock,
+        task_lineage_id="*",
+    )
+    assert refreshed.hint_id == original.hint_id
+    assert refreshed.ttl_expires_at == T0 + timedelta(hours=2)
+    assert len(_exposures(ledger)) == 1
+
+    clock.current = T0 + timedelta(seconds=50)
+    with pytest.raises(CooldownActive) as exc_info:
+        service.deliver(
+            _hint("h2", sources=[_source(ref="fork-2")]),
+            clock,
+            task_lineage_id="*",
+        )
+    assert exc_info.value.remaining_seconds == pytest.approx(250.0)
+    other = service.deliver(
+        _hint("h-other", sources=sources),
+        clock,
+        task_lineage_id="lineage-other",
+    )
+    assert other.hint_id == "h-other"
+    assert len(_exposures(ledger)) == 2
+
+
+def test_pending_cap_spans_tasks_inside_one_lineage(tmp_path: Path) -> None:
+    service, _, clock = _service(tmp_path)
+    service.deliver(
+        _hint("h1", task_id="task-1", sources=[_source(ref="a")]),
+        clock,
+        task_lineage_id="lin",
+    )
+    clock.current = T0 + timedelta(seconds=300)
+    service.deliver(
+        _hint("h2", task_id="task-1", sources=[_source(ref="b")]),
+        clock,
+        task_lineage_id="lin",
+    )
+    clock.current = T0 + timedelta(seconds=600)
+    with pytest.raises(PendingCapExceeded) as exc_info:
+        service.deliver(
+            _hint("h3", task_id="task-2", sources=[_source(ref="c")]),
+            clock,
+            task_lineage_id="lin",
+        )
+    assert exc_info.value.cap == 2
+    opened = service.deliver(
+        _hint("h4", task_id="task-2", sources=[_source(ref="d")]),
+        clock,
+        task_lineage_id="lin-other",
+    )
+    assert opened.hint_id == "h4"
+    assert service.pending_count("task-1", "agent-1", "lin") == 2
+    assert service.pending_count("task-2", "agent-1", "lin") == 0
+
+
+def test_lineage_throttle_reloads_and_legacy_cooldown_is_star_bucket(tmp_path: Path) -> None:
+    service, ledger, clock = _service(tmp_path)
+    service.deliver(
+        _hint("h1", sources=[_source(ref="fork-1")]),
+        clock,
+        task_lineage_id="lineage-a",
+    )
+    reloaded = HintDeliveryService(service.path, ledger, clock=clock)
+    clock.current = T0 + timedelta(seconds=100)
+    with pytest.raises(CooldownActive):
+        reloaded.deliver(
+            _hint("h2", sources=[_source(ref="fork-2")]),
+            clock,
+            task_lineage_id="lineage-a",
+        )
+    other = reloaded.deliver(
+        _hint("h3", sources=[_source(ref="fork-3")]),
+        clock,
+        task_lineage_id="lineage-b",
+    )
+    assert other.hint_id == "h3"
+    clock.current = T0 + timedelta(seconds=300)
+    again = reloaded.deliver(
+        _hint("h-dup", sources=[_source(ref="fork-1")]),
+        clock,
+        task_lineage_id="lineage-a",
+    )
+    assert again.hint_id == "h1"
+
+    legacy = tmp_path / "legacy-memory-hints.json"
+    legacy.write_text(
+        json.dumps({"last_delivery_at": {"agent-1": "2026-01-01T00:00:00Z"}}) + "\n",
+        encoding="utf-8",
+    )
+    legacy_clock = MutableClock(T0 + timedelta(seconds=100))
+    legacy_service = HintDeliveryService(
+        legacy,
+        CitationLedger(tmp_path / "legacy-ledger.jsonl", clock=legacy_clock),
+        clock=legacy_clock,
+    )
+    with pytest.raises(CooldownActive) as exc_info:
+        legacy_service.deliver(_hint("legacy-1"), legacy_clock)
+    assert exc_info.value.task_lineage_id == "*"
+    assert exc_info.value.remaining_seconds == pytest.approx(200.0)
+    moved = legacy_service.deliver(
+        _hint("legacy-2", sources=[_source(ref="fork-2")]),
+        legacy_clock,
+        task_lineage_id="lineage-b",
+    )
+    assert moved.hint_id == "legacy-2"

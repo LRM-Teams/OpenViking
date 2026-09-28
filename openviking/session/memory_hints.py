@@ -5,6 +5,7 @@
 A Memory Hint is a task/run-scoped terminal consumption event. It is not
 executable, target agent decides. Delivery is ``memory@target_agent`` only:
 the hint is not an explore hop and this module exposes no execute API.
+Throttle state is keyed by ``(target_agent_id, task_lineage_id)``.
 """
 
 from __future__ import annotations
@@ -66,6 +67,8 @@ DEFAULT_PENDING_CAP = 2
 DEFAULT_COOLDOWN_SECONDS = 300.0
 PREFERENCE_DEFER_REASON = "preference_defer_all"
 DEFAULT_POLICY_VERSION = "memory-hint-v1"
+# Literal bucket for deliveries that omit task_lineage_id.
+DEFAULT_TASK_LINEAGE = "*"
 
 Clock = Callable[[], datetime]
 
@@ -100,6 +103,13 @@ def _require_str(value: Any, field: str) -> str:
     if not isinstance(value, str) or value == "":
         raise ValueError(f"{field} must be a non-empty string")
     return value
+
+
+def _normalize_lineage(task_lineage_id: str | None) -> str:
+    """Missing lineage shares the literal ``"*"`` bucket with an explicit ``"*"``."""
+    if task_lineage_id is None:
+        return DEFAULT_TASK_LINEAGE
+    return _require_str(task_lineage_id, "task_lineage_id")
 
 
 def _freeze_strs(values: Iterable[Any], field: str) -> tuple[str, ...]:
@@ -488,26 +498,42 @@ class DuplicateDisposition(Exception):
 
 
 class PendingCapExceeded(Exception):
-    """Raised when a task/target pair already has ``cap`` undisposed hints."""
+    """Raised when a target and task lineage already have ``cap`` undisposed hints."""
 
-    def __init__(self, task_id: str, target_agent_id: str, pending: int, cap: int) -> None:
+    def __init__(
+        self,
+        task_id: str,
+        target_agent_id: str,
+        pending: int,
+        cap: int,
+        task_lineage_id: str = DEFAULT_TASK_LINEAGE,
+    ) -> None:
         self.task_id = task_id
         self.target_agent_id = target_agent_id
         self.pending = pending
         self.cap = cap
+        self.task_lineage_id = task_lineage_id
         super().__init__(
-            f"pending hint cap {cap} exceeded for task {task_id} target {target_agent_id}"
+            "pending hint cap "
+            f"{cap} exceeded for target {target_agent_id} lineage {task_lineage_id}"
         )
 
 
 class CooldownActive(Exception):
-    """Raised when the target's last delivery is still inside the cooldown window."""
+    """Raised when this target and lineage are still inside the cooldown window."""
 
-    def __init__(self, target_agent_id: str, remaining_seconds: float) -> None:
+    def __init__(
+        self,
+        target_agent_id: str,
+        remaining_seconds: float,
+        task_lineage_id: str = DEFAULT_TASK_LINEAGE,
+    ) -> None:
         self.target_agent_id = target_agent_id
         self.remaining_seconds = remaining_seconds
+        self.task_lineage_id = task_lineage_id
         super().__init__(
-            f"cooldown active for {target_agent_id}: {remaining_seconds}s remaining"
+            f"cooldown active for {target_agent_id} lineage {task_lineage_id}: "
+            f"{remaining_seconds}s remaining"
         )
 
 
@@ -525,8 +551,10 @@ class HintDeliveryService:
 
     ``deliver`` addresses ``memory@target_agent`` and records hint exposure on
     the injected citation ledger. It does not execute the hint. Throttle
-    defaults follow Q119-A: pending cap 2, cooldown 300 seconds, and same
-    source-set provenance refreshes TTL instead of sending again.
+    defaults follow Q119-A: pending cap 2 and cooldown 300 seconds, scoped to
+    ``(target_agent_id, task_lineage_id)``. Omitting the lineage uses ``"*"``.
+    Same source-set provenance inside one task and lineage refreshes TTL
+    instead of sending again.
     """
 
     def __init__(
@@ -557,7 +585,8 @@ class HintDeliveryService:
         self._lock = threading.Lock()
         self._hints: dict[str, MemoryHint] = {}
         self._hint_order: list[str] = []
-        self._provenance_index: dict[tuple[str, str, str], str] = {}
+        self._hint_lineage: dict[str, str] = {}
+        self._provenance_index: dict[tuple[str, str, str, str], str] = {}
         self._dispositions: list[MemoryDisposition] = []
         self._amendments: list[DispositionAmendment] = []
         self._silenced_hint_ids: set[str] = set()
@@ -565,7 +594,7 @@ class HintDeliveryService:
         self._outcomes: list[OutcomeRecord] = []
         self._preferences: dict[str, TargetPreference] = {}
         self._expired: set[str] = set()
-        self._last_delivery_at: dict[str, datetime] = {}
+        self._last_delivery_at: dict[tuple[str, str], datetime] = {}
         self._load()
 
     @property
@@ -613,17 +642,25 @@ class HintDeliveryService:
         self,
         hint: MemoryHint,
         clock: Clock | datetime | None = None,
+        *,
+        task_lineage_id: str | None = None,
     ) -> MemoryHint:
         """Deliver ``hint`` to its target agent.
 
-        Records one hint exposure when a new hint is accepted. Same source-set
-        provenance does not resend: TTL is refreshed and the original hint_id
-        is returned. ``defer_all`` still records exposure, then appends a
-        system disposition with reason ``preference_defer_all``. ``silence_all``
-        still records exposure and does not append a disposition.
+        ``task_lineage_id`` selects the throttle bucket. Omitting it, or passing
+        none, uses the literal ``"*"`` bucket. Pending cap and cooldown are
+        counted on ``(target_agent_id, task_lineage_id)`` and do not cross
+        lineages. Same source-set provenance dedups inside that bucket and the
+        hint's task: TTL is refreshed and the original hint_id is returned.
+
+        Records one hint exposure when a new hint is accepted. ``defer_all``
+        still records exposure, then appends a system disposition with reason
+        ``preference_defer_all``. ``silence_all`` still records exposure and
+        does not append a disposition. TTL expiry still records exposure only.
         """
         if not isinstance(hint, MemoryHint):
             raise TypeError("hint must be a MemoryHint")
+        lineage = _normalize_lineage(task_lineage_id)
         now = self._resolve_now(clock)
         with self._lock:
             preference = self._preferences.get(hint.target_agent_id)
@@ -636,6 +673,7 @@ class HintDeliveryService:
             dedup_key = (
                 hint.task_id,
                 hint.target_agent_id,
+                lineage,
                 provenance_content_hash(hint.sources),
             )
             existing_id = self._provenance_index.get(dedup_key)
@@ -644,26 +682,29 @@ class HintDeliveryService:
                 self._hints[existing_id] = refreshed
                 self._persist()
                 return refreshed
-            pending = self._pending_count_locked(hint.task_id, hint.target_agent_id)
+            pending = self._pending_count_locked(hint.target_agent_id, lineage)
             if pending >= self._pending_cap:
                 raise PendingCapExceeded(
                     hint.task_id,
                     hint.target_agent_id,
                     pending,
                     self._pending_cap,
+                    lineage,
                 )
-            last = self._last_delivery_at.get(hint.target_agent_id)
+            last = self._last_delivery_at.get((hint.target_agent_id, lineage))
             if last is not None:
                 elapsed = (now - last).total_seconds()
                 if elapsed < self._cooldown_seconds:
                     raise CooldownActive(
                         hint.target_agent_id,
                         self._cooldown_seconds - elapsed,
+                        lineage,
                     )
             if hint.hint_id in self._hints:
                 raise ValueError(f"hint already exists: {hint.hint_id}")
             self._hints[hint.hint_id] = hint
             self._hint_order.append(hint.hint_id)
+            self._hint_lineage[hint.hint_id] = lineage
             self._provenance_index[dedup_key] = hint.hint_id
             try:
                 self._record_exposure(hint)
@@ -671,8 +712,9 @@ class HintDeliveryService:
                 self._hints.pop(hint.hint_id, None)
                 self._hint_order.pop()
                 self._provenance_index.pop(dedup_key, None)
+                self._hint_lineage.pop(hint.hint_id, None)
                 raise
-            self._last_delivery_at[hint.target_agent_id] = now
+            self._last_delivery_at[(hint.target_agent_id, lineage)] = now
             if preference is not None and preference.defer_all:
                 self._dispositions.append(
                     MemoryDisposition(
@@ -839,14 +881,36 @@ class HintDeliveryService:
                 return STATE_EXPIRED
             return STATE_PENDING
 
-    def pending_count(self, task_id: str, target_agent_id: str) -> int:
-        with self._lock:
-            return self._pending_count_locked(task_id, target_agent_id)
+    def pending_count(
+        self,
+        task_id: str,
+        target_agent_id: str,
+        task_lineage_id: str | None = None,
+    ) -> int:
+        """Pending hints for one task inside a target/lineage throttle bucket.
 
-    def _pending_count_locked(self, task_id: str, target_agent_id: str) -> int:
+        The delivery cap counts every pending hint for
+        ``(target_agent_id, task_lineage_id)`` across tasks. This query reports
+        only ``task_id`` within that bucket. Omitted lineage is ``"*"``.
+        """
+        lineage = _normalize_lineage(task_lineage_id)
+        with self._lock:
+            return self._pending_count_locked(target_agent_id, lineage, task_id=task_id)
+
+    def _pending_count_locked(
+        self,
+        target_agent_id: str,
+        task_lineage_id: str,
+        *,
+        task_id: str | None = None,
+    ) -> int:
         count = 0
         for hint_id, hint in self._hints.items():
-            if hint.task_id != task_id or hint.target_agent_id != target_agent_id:
+            if hint.target_agent_id != target_agent_id:
+                continue
+            if task_id is not None and hint.task_id != task_id:
+                continue
+            if self._hint_lineage.get(hint_id, DEFAULT_TASK_LINEAGE) != task_lineage_id:
                 continue
             if hint_id in self._expired or hint_id in self._silenced_hint_ids:
                 continue
@@ -917,9 +981,11 @@ class HintDeliveryService:
             "outcomes": [row.to_dict() for row in self._outcomes],
             "preferences": [pref.to_dict() for pref in self._preferences.values()],
             "expired_hint_ids": sorted(self._expired),
-            "last_delivery_at": {
-                agent: _format_dt(moment) for agent, moment in sorted(self._last_delivery_at.items())
+            "hint_lineages": {
+                hint_id: self._hint_lineage.get(hint_id, DEFAULT_TASK_LINEAGE)
+                for hint_id in self._hint_order
             },
+            "last_delivery_at": _dump_last_delivery(self._last_delivery_at),
         }
 
     def _persist(self) -> None:
@@ -934,16 +1000,30 @@ class HintDeliveryService:
         payload = json.loads(self._path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("memory hint store must be a JSON object")
+        raw_lineages = payload.get("hint_lineages", {})
+        if not isinstance(raw_lineages, dict):
+            raise ValueError("hint_lineages must be an object")
+        hint_lineage = {
+            _require_str(hint_id, "hint_id"): _require_str(lineage, "task_lineage_id")
+            for hint_id, lineage in raw_lineages.items()
+        }
         hints: dict[str, MemoryHint] = {}
         order: list[str] = []
-        index: dict[tuple[str, str, str], str] = {}
+        index: dict[tuple[str, str, str, str], str] = {}
         for raw in payload.get("hints", []):
             hint = MemoryHint.from_dict(raw)
             hints[hint.hint_id] = hint
             order.append(hint.hint_id)
-            index[(hint.task_id, hint.target_agent_id, provenance_content_hash(hint.sources))] = (
-                hint.hint_id
-            )
+            lineage = hint_lineage.get(hint.hint_id, DEFAULT_TASK_LINEAGE)
+            hint_lineage[hint.hint_id] = lineage
+            index[
+                (
+                    hint.task_id,
+                    hint.target_agent_id,
+                    lineage,
+                    provenance_content_hash(hint.sources),
+                )
+            ] = hint.hint_id
         dispositions = [MemoryDisposition.from_dict(raw) for raw in payload.get("dispositions", [])]
         amendments = [DispositionAmendment.from_dict(raw) for raw in payload.get("amendments", [])]
         silenced = payload.get("silenced_hint_ids", [])
@@ -958,13 +1038,10 @@ class HintDeliveryService:
             )
         }
         expired = set(payload.get("expired_hint_ids", []))
-        last_raw = payload.get("last_delivery_at", {})
-        last_delivery = {
-            _require_str(agent, "last_delivery_at agent"): _parse_dt(moment, "last_delivery_at")
-            for agent, moment in last_raw.items()
-        }
+        last_delivery = _load_last_delivery(payload.get("last_delivery_at", {}))
         self._hints = hints
         self._hint_order = order
+        self._hint_lineage = hint_lineage
         self._provenance_index = index
         self._dispositions = dispositions
         self._amendments = amendments
@@ -974,6 +1051,37 @@ class HintDeliveryService:
         self._preferences = preferences
         self._expired = {hint_id for hint_id in expired if isinstance(hint_id, str)}
         self._last_delivery_at = last_delivery
+
+
+def _dump_last_delivery(
+    last: Mapping[tuple[str, str], datetime],
+) -> dict[str, dict[str, str]]:
+    nested: dict[str, dict[str, str]] = {}
+    for agent, lineage in sorted(last):
+        nested.setdefault(agent, {})[lineage] = _format_dt(last[(agent, lineage)])
+    return nested
+
+
+def _load_last_delivery(raw: Any) -> dict[tuple[str, str], datetime]:
+    """Load cooldown timestamps.
+
+    Current stores nest ``{agent: {lineage: iso}}``. Older stores mapped each
+    agent to one timestamp; those rows load into the ``"*"`` bucket.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("last_delivery_at must be an object")
+    loaded: dict[tuple[str, str], datetime] = {}
+    for agent, value in raw.items():
+        agent_id = _require_str(agent, "last_delivery_at agent")
+        if isinstance(value, str):
+            loaded[(agent_id, DEFAULT_TASK_LINEAGE)] = _parse_dt(value, "last_delivery_at")
+            continue
+        if not isinstance(value, dict):
+            raise ValueError("last_delivery_at entries must be timestamps or lineage maps")
+        for lineage, moment in value.items():
+            lineage_id = _require_str(lineage, "task_lineage_id")
+            loaded[(agent_id, lineage_id)] = _parse_dt(moment, "last_delivery_at")
+    return loaded
 
 
 def _resolve_store_path(path: Path) -> Path:
