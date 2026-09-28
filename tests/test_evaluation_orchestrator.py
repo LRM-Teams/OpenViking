@@ -31,6 +31,7 @@ from openviking.session.evaluation_orchestrator import (
     OrchestratorState,
     WorkerSeatPool,
 )
+from openviking.session.handoff_envelope import content_address
 
 T0 = datetime(2026, 9, 24, tzinfo=timezone.utc)
 
@@ -419,3 +420,17 @@ def test_entering_diagnosis_rejects_batch_above_three(tmp_path) -> None:
     assert lease.hold.acquired_at == "2026-09-24T00:00:00.000Z"
     lease.release()
     assert plain.seats.held_snapshot() == ()
+
+
+def test_payload_hash_is_content_address_of_canonical_json(tmp_path) -> None:
+    payload = {"step": EVENT_MEMORY_RETRIEVE, "refs": ["b", "a"]}
+    first = _orchestrator(tmp_path, "hash-a.json")
+    recorded = first.advance(EVENT_MEMORY_RETRIEVE, payload)
+    assert recorded.payload_hash == content_address(payload)
+    assert recorded.payload_hash == content_address({"refs": ["b", "a"], "step": EVENT_MEMORY_RETRIEVE})
+    assert recorded.payload_hash != content_address({"step": EVENT_MEMORY_RETRIEVE, "refs": ["a"]})
+
+    second = _orchestrator(tmp_path, "hash-b.json")
+    empty = second.advance(EVENT_MEMORY_RETRIEVE)
+    assert empty.payload_hash == content_address({})
+    assert len(empty.payload_hash) == 64

@@ -14,7 +14,6 @@ instead of waiting.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import threading
 import uuid
@@ -24,6 +23,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from openviking.session.handoff_envelope import content_address
 
 STORE_FILENAME = "evaluation-orchestrator.json"
 
@@ -174,10 +175,6 @@ def _require_str(value: Any, field: str) -> str:
     return value
 
 
-def _canonical_dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
 def _copy_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
     copied: dict[str, Any] = {}
     for key, value in evidence.items():
@@ -189,8 +186,14 @@ def _copy_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _payload_hash(payload: Mapping[str, Any] | None) -> str:
+    """Content address of the event payload.
+
+    ``sha256`` of canonical JSON (sorted keys, compact separators), the same
+    encoding as handoff ``content_address``. An empty payload hashes ``{}``,
+    not a stand-in digest.
+    """
     body = dict(payload) if payload else {}
-    return hashlib.sha256(_canonical_dumps(body).encode("utf-8")).hexdigest()
+    return content_address(body)
 
 
 _JSON_MAP = "map"
@@ -687,7 +690,8 @@ class EvaluationOrchestrator:
         ``outcome_envelope_id``. When ``write_hooks`` supplies
         ``on_brief_envelope`` or ``on_revision_commit``, the hook runs before
         the transition and its returned id is stored on the event ``evidence``
-        field beside ``payload_hash``. Missing evidence raises
+        field beside ``payload_hash``. ``payload_hash`` is the content
+        address of the payload. Missing evidence raises
         ``MissingTransitionEvidence`` and does not move state. Entering
         ``DIAGNOSIS`` with ``diagnosis_batch`` above the diagnosis seat limit
         raises ``NoSeatError`` and does not move state. That check sits beside
