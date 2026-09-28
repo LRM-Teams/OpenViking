@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -28,6 +30,8 @@ from openviking.session.influence_view import (
 )
 from openviking.session.retrieval_facade import (
     FEATURE_SPEC_VERSION,
+    NO_ELIGIBLE_EXPLORATION_REASON,
+    SELECTION_POLICY_VERSION,
     ForkBranchAdapter,
     HybridRetrievalFacade,
     InfluenceProjectionAdapter,
@@ -209,13 +213,88 @@ def _facade(
     session_id: str,
     *,
     views: list | None = None,
+    seed: str | int | None = None,
 ) -> HybridRetrievalFacade:
     projection = InfluenceProjectionAdapter(registry, views=views)
     return HybridRetrievalFacade(
         ForkBranchAdapter(root, store),
         projection,
         SegmentAtomAdapter(session_dir, session_id),
+        seed=seed,
     )
+
+
+def _fork_lane(
+    tmp_path: Path,
+    name: str,
+    *,
+    validated: int = 0,
+    provisional: int = 0,
+    hidden_provisional: int = 0,
+) -> tuple[Path, CausalExperiencesStore, Path, list[str], list[str], list[str]]:
+    root = tmp_path / name
+    store = _store(root)
+    hidden_ids = [
+        _commit_fork(
+            store,
+            ao_id=f"ao-h-{index}",
+            workspace="secret",
+            status="provisional",
+        )
+        for index in range(hidden_provisional)
+    ]
+    validated_ids = [
+        _commit_fork(
+            store,
+            ao_id=f"ao-v-{index}",
+            workspace="team-a",
+            status="validated",
+        )
+        for index in range(validated)
+    ]
+    provisional_ids = [
+        _commit_fork(
+            store,
+            ao_id=f"ao-p-{index}",
+            workspace="team-a",
+            status="provisional",
+        )
+        for index in range(provisional)
+    ]
+    session_dir = root / "sess"
+    AOLedger(session_dir, "sess")
+    return root, store, session_dir, validated_ids, provisional_ids, hidden_ids
+
+
+def _open_lane(
+    root: Path,
+    store: CausalExperiencesStore,
+    session_dir: Path,
+    *,
+    seed: str | int | None = None,
+) -> HybridRetrievalFacade:
+    return _facade(
+        root,
+        store,
+        ProjectionRegistry(root / "projections.json"),
+        session_dir,
+        "sess",
+        seed=seed,
+    )
+
+
+def _fork_id(card: RetrievalCard) -> str:
+    return str(card.source_pointer["fork_node_id"])
+
+
+def _expected_query_seed(text: str, pattern: dict[str, str] | None = None) -> str:
+    payload = json.dumps(
+        {"text": text, "dependency_pattern": pattern},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).digest()[:8].hex()
 
 
 def _append_ao(ledger: AOLedger, *, labels: list[str], record_kind: str = "atom") -> str:
@@ -681,3 +760,230 @@ def test_projection_adapter_hides_invisible_cards(tmp_path: Path) -> None:
     assert all(card.source_pointer["view_revision_id"] != "rev-hid" for card in cards)
     dumped = {entry["card"]["card_id"] for entry in registry.to_dict()["entries"]}
     assert len(dumped) > len(registry_ids)
+
+
+def test_provisional_quota_is_three_exploitation_plus_one_exploration(tmp_path: Path) -> None:
+    root, store, session_dir, validated_ids, provisional_ids, _hidden = _fork_lane(
+        tmp_path,
+        "three-plus-one",
+        validated=8,
+        provisional=4,
+    )
+    facade = _open_lane(root, store, session_dir, seed="slot-seed")
+    profile = RetrievalProfile(fork_branch=12, projection=0, segment_atom=0)
+    result = facade.retrieve({}, _PRINCIPAL, profile)
+    again = facade.retrieve({}, _PRINCIPAL, profile)
+
+    assert len(result.cards) == 12
+    verified = [card for card in result.cards if card.channel == "verified"]
+    provisional = [card for card in result.cards if card.channel == "provisional"]
+    assert [card.in_channel_rank for card in verified] == list(range(1, 9))
+    assert [_fork_id(card) for card in verified] == validated_ids
+    assert all(card.selection_mode == "exploitation" for card in verified)
+    assert [card.selection_mode for card in provisional] == [
+        "exploitation",
+        "exploitation",
+        "exploitation",
+        "exploration",
+    ]
+    assert [card.in_channel_rank for card in provisional] == [1, 2, 3, 4]
+    assert [_fork_id(card) for card in provisional[:3]] == provisional_ids[:3]
+    assert _fork_id(provisional[3]) == provisional_ids[3]
+    assert _fork_id(provisional[3]) not in set(provisional_ids[:3])
+
+    audit = result.selection_audit
+    assert audit is not None
+    assert audit.backfill is False
+    assert audit.backfill_reason is None
+    assert audit.seed == "slot-seed"
+    assert audit.selection_policy_version == SELECTION_POLICY_VERSION
+    assert audit.eligible_set == (provisional[3].payload_ref,)
+    assert audit.selection_propensity == 1.0
+    assert provisional[3].payload_ref in audit.eligible_set
+    assert RetrievalCard.from_dict(provisional[3].to_dict()) == provisional[3]
+    assert provisional[3].to_dict()["selection_mode"] == "exploration"
+    assert result.to_dict()["selection_audit"]["eligible_set"] == [provisional[3].payload_ref]
+    assert [(card.payload_ref, card.selection_mode) for card in result.cards] == [
+        (card.payload_ref, card.selection_mode) for card in again.cards
+    ]
+    assert again.selection_audit == audit
+
+
+def test_exploration_selection_is_seeded_and_audited(tmp_path: Path) -> None:
+    root, store, session_dir, _validated, provisional_ids, _hidden = _fork_lane(
+        tmp_path,
+        "seeded",
+        provisional=8,
+    )
+    profile = RetrievalProfile(fork_branch=8, projection=0, segment_atom=0)
+
+    def explore(seed: str) -> RetrievalCard:
+        result = _open_lane(root, store, session_dir, seed=seed).retrieve({}, _PRINCIPAL, profile)
+        assert len(result.cards) <= 12
+        explored = [card for card in result.cards if card.selection_mode == "exploration"]
+        assert len(explored) == 1
+        audit = result.selection_audit
+        assert audit is not None
+        assert audit.backfill is False
+        assert audit.seed == seed
+        assert audit.selection_policy_version == SELECTION_POLICY_VERSION
+        assert len(audit.eligible_set) == 5
+        assert audit.selection_propensity == 1.0 / len(audit.eligible_set)
+        assert explored[0].payload_ref in audit.eligible_set
+        by_ref = {card.payload_ref: card for card in result.cards}
+        eligible_ids = {_fork_id(by_ref[ref]) for ref in audit.eligible_set}
+        assert eligible_ids == set(provisional_ids[3:])
+        assert _fork_id(explored[0]) in set(provisional_ids[3:])
+        prefix = [
+            card
+            for card in result.cards
+            if card.channel == "provisional" and card.in_channel_rank <= 3
+        ]
+        assert {_fork_id(card) for card in prefix} == set(provisional_ids[:3])
+        assert {card.selection_mode for card in prefix} == {"exploitation"}
+        return explored[0]
+
+    first = explore("seed-a")
+    assert explore("seed-a").payload_ref == first.payload_ref
+    assert any(explore(f"seed-{index}").payload_ref != first.payload_ref for index in range(24))
+
+
+def test_exploration_backfill_when_no_eligible_candidate(tmp_path: Path) -> None:
+    root, store, session_dir, validated_ids, provisional_ids, _hidden = _fork_lane(
+        tmp_path,
+        "backfill",
+        validated=9,
+        provisional=3,
+    )
+    result = _open_lane(root, store, session_dir, seed="backfill-seed").retrieve(
+        {},
+        _PRINCIPAL,
+        RetrievalProfile(fork_branch=12, projection=0, segment_atom=0),
+    )
+    assert len(result.cards) <= 12
+    provisional = [card for card in result.cards if card.channel == "provisional"]
+    assert [_fork_id(card) for card in provisional] == provisional_ids
+    assert [card.in_channel_rank for card in provisional] == [1, 2, 3]
+    assert {card.selection_mode for card in result.cards} == {"exploitation"}
+    ninth = next(card for card in result.cards if card.in_channel_rank == 9)
+    assert ninth.channel == "verified"
+    assert ninth.selection_mode == "exploitation"
+    assert _fork_id(ninth) == validated_ids[8]
+    audit = result.selection_audit
+    assert audit is not None
+    assert audit.backfill is True
+    assert audit.backfill_reason == NO_ELIGIBLE_EXPLORATION_REASON
+    assert audit.eligible_set == ()
+    assert audit.selection_propensity is None
+    assert audit.seed == "backfill-seed"
+    assert result.to_dict()["selection_audit"]["backfill"] is True
+    assert result.to_dict()["selection_audit"]["backfill_reason"] == NO_ELIGIBLE_EXPLORATION_REASON
+
+
+def test_raised_provisional_quota_keeps_single_exploration_seat(tmp_path: Path) -> None:
+    root, store, session_dir, _validated, provisional_ids, _hidden = _fork_lane(
+        tmp_path,
+        "raised-quota",
+        provisional=8,
+    )
+    result = _open_lane(root, store, session_dir, seed="raised").retrieve(
+        {},
+        _PRINCIPAL,
+        {
+            "fork_branch": 8,
+            "projection": 0,
+            "segment_atom": 0,
+            "provisional_slots": 6,
+        },
+    )
+    assert len(result.cards) <= 12
+    explored = [card for card in result.cards if card.selection_mode == "exploration"]
+    assert len(explored) == 1
+    assert explored[0].in_channel_rank >= 6
+    assert _fork_id(explored[0]) in set(provisional_ids[5:])
+    prefix = [
+        card for card in result.cards if card.channel == "provisional" and card.in_channel_rank <= 5
+    ]
+    assert {_fork_id(card) for card in prefix} == set(provisional_ids[:5])
+    assert {card.selection_mode for card in prefix} == {"exploitation"}
+    audit = result.selection_audit
+    assert audit is not None
+    assert audit.backfill is False
+    assert len(audit.eligible_set) == 3
+    assert audit.selection_propensity == 1.0 / 3
+    assert explored[0].payload_ref in audit.eligible_set
+    by_ref = {card.payload_ref: card for card in result.cards}
+    assert {_fork_id(by_ref[ref]) for ref in audit.eligible_set} == set(provisional_ids[5:])
+
+
+def test_query_derived_seed_and_default_selection_mode(tmp_path: Path) -> None:
+    root = tmp_path / "derived-seed"
+    store = _store(root)
+    registry = ProjectionRegistry(root / "projections.json")
+    session_dir = root / "sess-facts"
+    ledger = AOLedger(session_dir, "sess-facts")
+    _append_ao(ledger, labels=["team-a"])
+    facade = _facade(root, store, registry, session_dir, "sess-facts")
+    profile = RetrievalProfile(fork_branch=0, projection=0, segment_atom=1)
+    empty = facade.retrieve({}, _PRINCIPAL, profile)
+    alpha = facade.retrieve({"text": "alpha"}, _PRINCIPAL, profile)
+    beta = facade.retrieve({"text": "beta"}, _PRINCIPAL, profile)
+    patterned = facade.retrieve(
+        {"text": "alpha", "dependency_pattern": {"wanted_artifact": "patch"}},
+        _PRINCIPAL,
+        profile,
+    )
+    assert empty.selection_audit is not None
+    assert empty.selection_audit.seed == _expected_query_seed("")
+    assert len(empty.selection_audit.seed) == 16
+    assert alpha.selection_audit is not None
+    assert beta.selection_audit is not None
+    assert patterned.selection_audit is not None
+    assert alpha.selection_audit.seed == _expected_query_seed("alpha")
+    assert beta.selection_audit.seed == _expected_query_seed("beta")
+    assert alpha.selection_audit.seed != beta.selection_audit.seed
+    assert patterned.selection_audit.seed == _expected_query_seed(
+        "alpha", {"wanted_artifact": "patch"}
+    )
+    assert patterned.selection_audit.seed != alpha.selection_audit.seed
+    repeated = facade.retrieve({"text": "alpha"}, _PRINCIPAL, profile)
+    assert repeated.selection_audit == alpha.selection_audit
+    facts = [card for card in empty.cards if card.channel == "fact"]
+    assert len(facts) == 1
+    assert facts[0].selection_mode == "exploitation"
+    seeded = _facade(root, store, registry, session_dir, "sess-facts", seed="explicit-seed")
+    seeded_alpha = seeded.retrieve({"text": "alpha"}, _PRINCIPAL, profile)
+    seeded_beta = seeded.retrieve({"text": "beta"}, _PRINCIPAL, profile)
+    assert seeded_alpha.selection_audit is not None
+    assert seeded_beta.selection_audit is not None
+    assert seeded_alpha.selection_audit.seed == "explicit-seed"
+    assert seeded_beta.selection_audit.seed == "explicit-seed"
+
+
+def test_exploration_eligible_set_excludes_acl_hidden(tmp_path: Path) -> None:
+    root, store, session_dir, _validated, visible_ids, hidden_ids = _fork_lane(
+        tmp_path,
+        "acl-explore",
+        provisional=6,
+        hidden_provisional=4,
+    )
+    result = _open_lane(root, store, session_dir, seed="acl-seed").retrieve(
+        {},
+        _PRINCIPAL,
+        RetrievalProfile(fork_branch=6, projection=0, segment_atom=0),
+    )
+    assert len(result.cards) <= 12
+    assert hidden_ids
+    assert all(_fork_id(card) not in set(hidden_ids) for card in result.cards)
+    assert {_fork_id(card) for card in result.cards} == set(visible_ids)
+    explored = [card for card in result.cards if card.selection_mode == "exploration"]
+    assert len(explored) == 1
+    assert _fork_id(explored[0]) in set(visible_ids[3:])
+    audit = result.selection_audit
+    assert audit is not None
+    assert audit.backfill is False
+    by_ref = {card.payload_ref: card for card in result.cards}
+    eligible_ids = {_fork_id(by_ref[ref]) for ref in audit.eligible_set}
+    assert eligible_ids == set(visible_ids[3:])
+    assert eligible_ids.isdisjoint(hidden_ids)
+    assert all(set(card.acl_labels) & set(_PRINCIPAL) for card in result.cards)

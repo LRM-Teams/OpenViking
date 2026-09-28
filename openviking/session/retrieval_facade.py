@@ -5,9 +5,12 @@
 Three corpus adapters share one card envelope. Storage and identity stay
 separate: fork/branch, block/claim projection, and segment/atom facts are
 not collapsed into one corpus. Verified/provisional slotting (8/4, with
-backfill) applies only to stateful cards. Segment/atom cards stay on the
-fact channel. Dependency-pattern hits expand inside one frozen view at read
-time and do not write a stored object.
+backfill) applies only to stateful cards. When the provisional quota is
+``n >= 2``, those seats are ``n - 1`` exploitation cards in in-channel rank
+order plus one seeded exploration card drawn from the provisional candidates
+exploitation did not take. Segment/atom cards stay on the fact channel.
+Dependency-pattern hits expand inside one frozen view at read time and do
+not write a stored object.
 
 Online retrieval applies principal ACL inside each adapter before the quota
 is spent, then clamps the reranked list back to the causal-memory cap.
@@ -20,6 +23,7 @@ Online projection lookup goes through ``ProjectionRegistry.search``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
@@ -45,6 +49,8 @@ from openviking.session.influence_projection import InfluenceProjection, Project
 from openviking.session.influence_view import InfluenceClaim, InfluenceViewRevision
 
 FEATURE_SPEC_VERSION = "ranker-feature-spec-v1"
+SELECTION_POLICY_VERSION = "provisional-selection-v1"
+NO_ELIGIBLE_EXPLORATION_REASON = "no_eligible_exploration_candidate"
 
 CAUSAL_MEMORY_CAP = 12
 DEFAULT_FORK_BRANCH_QUOTA = 6
@@ -62,11 +68,13 @@ CardKind = Literal[
     "atom",
 ]
 CardChannel = Literal["verified", "provisional", "fact"]
+SelectionMode = Literal["exploitation", "exploration"]
 
 CARD_KINDS = frozenset(
     ("fork", "branch", "block_projection", "claim_projection", "segment", "atom")
 )
 CARD_CHANNELS = frozenset(("verified", "provisional", "fact"))
+SELECTION_MODES = frozenset(("exploitation", "exploration"))
 STATEFUL_CHANNELS = frozenset(("verified", "provisional"))
 FACT_KINDS = frozenset(("segment", "atom"))
 
@@ -136,6 +144,7 @@ class RetrievalCard:
     payload_ref: str
     score_breakdown: dict[str, Any]
     acl_labels: tuple[str, ...] = ()
+    selection_mode: SelectionMode = "exploitation"
 
     def __post_init__(self) -> None:
         if self.kind not in CARD_KINDS:
@@ -143,6 +152,11 @@ class RetrievalCard:
         if self.channel not in CARD_CHANNELS:
             raise ValueError(
                 f"channel must be one of {sorted(CARD_CHANNELS)}, got {self.channel!r}"
+            )
+        if self.selection_mode not in SELECTION_MODES:
+            raise ValueError(
+                "selection_mode must be one of "
+                f"{sorted(SELECTION_MODES)}, got {self.selection_mode!r}"
             )
         object.__setattr__(self, "in_channel_rank", _require_rank(self.in_channel_rank))
         object.__setattr__(self, "status_label", _require_str(self.status_label, "status_label"))
@@ -169,6 +183,7 @@ class RetrievalCard:
             "payload_ref": self.payload_ref,
             "score_breakdown": _json_copy(self.score_breakdown, "score_breakdown"),
             "acl_labels": list(self.acl_labels),
+            "selection_mode": self.selection_mode,
         }
 
     @classmethod
@@ -186,6 +201,7 @@ class RetrievalCard:
             payload_ref=str(payload.get("payload_ref") or ""),
             score_breakdown=_require_mapping(payload.get("score_breakdown"), "score_breakdown"),
             acl_labels=tuple(str(item) for item in labels),
+            selection_mode=payload.get("selection_mode", "exploitation"),
         )
 
 
@@ -231,17 +247,25 @@ def coerce_query(value: RetrievalQuery | Mapping[str, Any] | str | None) -> Retr
 
 @dataclass(frozen=True)
 class RetrievalProfile:
-    """Per-corpus budgets inside the causal-memory lane. Their sum cannot exceed 12."""
+    """Per-corpus budgets inside the causal-memory lane. Their sum cannot exceed 12.
+
+    ``provisional_slots`` is the provisional channel quota (default 4). It is
+    not a fourth corpus budget and is not added to that sum. For ``n >= 2``
+    the quota is filled as ``n - 1`` exploitation seats plus one exploration
+    seat.
+    """
 
     fork_branch: int = DEFAULT_FORK_BRANCH_QUOTA
     projection: int = DEFAULT_PROJECTION_QUOTA
     segment_atom: int = DEFAULT_SEGMENT_ATOM_QUOTA
+    provisional_slots: int = PROVISIONAL_SLOTS
 
     def to_dict(self) -> dict[str, int]:
         return {
             "fork_branch": self.fork_branch,
             "projection": self.projection,
             "segment_atom": self.segment_atom,
+            "provisional_slots": self.provisional_slots,
         }
 
 
@@ -266,10 +290,14 @@ def coerce_profile(value: RetrievalProfile | Mapping[str, Any] | None) -> Retrie
             segment_atom=_quota_int(
                 payload.get("segment_atom", DEFAULT_SEGMENT_ATOM_QUOTA), "segment_atom"
             ),
+            provisional_slots=_quota_int(
+                payload.get("provisional_slots", PROVISIONAL_SLOTS), "provisional_slots"
+            ),
         )
     fork_branch = _quota_int(profile.fork_branch, "fork_branch")
     projection = _quota_int(profile.projection, "projection")
     segment_atom = _quota_int(profile.segment_atom, "segment_atom")
+    provisional_slots = _quota_int(profile.provisional_slots, "provisional_slots")
     total = fork_branch + projection + segment_atom
     if total > CAUSAL_MEMORY_CAP:
         raise QuotaError(
@@ -277,7 +305,10 @@ def coerce_profile(value: RetrievalProfile | Mapping[str, Any] | None) -> Retrie
             total=total,
         )
     return RetrievalProfile(
-        fork_branch=fork_branch, projection=projection, segment_atom=segment_atom
+        fork_branch=fork_branch,
+        projection=projection,
+        segment_atom=segment_atom,
+        provisional_slots=provisional_slots,
     )
 
 
@@ -305,16 +336,41 @@ class AssembledPath:
 
 
 @dataclass(frozen=True)
+class SelectionAudit:
+    """Logged draw for the provisional exploration seat (Q87-A)."""
+
+    eligible_set: tuple[str, ...]
+    selection_propensity: float | None
+    seed: str
+    selection_policy_version: str
+    backfill: bool
+    backfill_reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "eligible_set": list(self.eligible_set),
+            "selection_propensity": self.selection_propensity,
+            "seed": self.seed,
+            "selection_policy_version": self.selection_policy_version,
+            "backfill": self.backfill,
+            "backfill_reason": self.backfill_reason,
+        }
+
+
+@dataclass(frozen=True)
 class RetrievalResult:
     cards: tuple[RetrievalCard, ...]
     feature_version: str
     truncated_by_rerank_clamp: bool = False
+    selection_audit: SelectionAudit | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        audit = None if self.selection_audit is None else self.selection_audit.to_dict()
         return {
             "cards": [card.to_dict() for card in self.cards],
             "feature_version": self.feature_version,
             "truncated_by_rerank_clamp": self.truncated_by_rerank_clamp,
+            "selection_audit": audit,
         }
 
 
@@ -839,26 +895,132 @@ def _assign_ranks(cards: Sequence[RetrievalCard], channel: str) -> list[Retrieva
     return [replace(card, in_channel_rank=index) for index, card in enumerate(group, start=1)]
 
 
-def _allocate_stateful(cards: Sequence[RetrievalCard]) -> list[RetrievalCard]:
-    """Fill 8 verified and 4 provisional slots. A short channel is backfilled.
+def _candidate_id(card: RetrievalCard) -> str:
+    return card.payload_ref
 
-    Backfilled cards keep the channel and in-channel rank they had before
-    slotting. Fact cards never enter this function.
+
+def _derive_query_seed(query: RetrievalQuery) -> str:
+    """Seed from the query envelope: sha256 digest, first 8 bytes, hex."""
+    payload = json.dumps(
+        query.to_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).digest()[:8].hex()
+
+
+def _normalize_seed(seed: str | int | None) -> str | None:
+    if seed is None:
+        return None
+    if isinstance(seed, bool) or not isinstance(seed, (str, int)):
+        raise ValueError("seed must be a str, int, or None")
+    text = str(seed)
+    if not text:
+        raise ValueError("seed must be non-empty when provided")
+    return text
+
+
+def _exploration_index(seed: str, eligible_count: int) -> int:
+    """Uniform index in ``[0, eligible_count)`` from a versioned seed digest.
+
+    Replay: ``eligible_set[_exploration_index(seed, len(eligible_set))]``.
     """
-    verified = _assign_ranks(cards, "verified")
+    material = f"{SELECTION_POLICY_VERSION}\n{seed}\n{eligible_count}".encode("utf-8")
+    draw = int.from_bytes(hashlib.sha256(material).digest()[:8], "big")
+    return draw % eligible_count
+
+
+def _select_provisional(
+    ranked: Sequence[RetrievalCard],
+    slots: int,
+    seed: str,
+) -> tuple[list[RetrievalCard], list[RetrievalCard], SelectionAudit]:
+    """Fill provisional seats: ``n - 1`` exploitation plus one seeded exploration.
+
+    ``ranked`` is in-channel rank order. Exploitation keeps that prefix.
+    Exploration is drawn uniformly from provisional cards exploitation did
+    not take (already ACL- and status-gated by the adapters). When that
+    eligible set is empty, the exploration seat stays open for the existing
+    exploitation backfill and the audit records ``backfill``. Unchosen cards
+    stay in rank order so a verified-slot shortage can still absorb them.
+    """
+    if slots < 2:
+        primary = [replace(card, selection_mode="exploitation") for card in ranked[:slots]]
+        overflow = [replace(card, selection_mode="exploitation") for card in ranked[slots:]]
+        audit = SelectionAudit(
+            eligible_set=(),
+            selection_propensity=None,
+            seed=seed,
+            selection_policy_version=SELECTION_POLICY_VERSION,
+            backfill=False,
+        )
+        return primary, overflow, audit
+
+    exploit_count = slots - 1
+    exploitation = list(ranked[:exploit_count])
+    eligible = list(ranked[exploit_count:])
+    if not eligible:
+        primary = [replace(card, selection_mode="exploitation") for card in exploitation]
+        audit = SelectionAudit(
+            eligible_set=(),
+            selection_propensity=None,
+            seed=seed,
+            selection_policy_version=SELECTION_POLICY_VERSION,
+            backfill=True,
+            backfill_reason=NO_ELIGIBLE_EXPLORATION_REASON,
+        )
+        return primary, [], audit
+
+    chosen = eligible[_exploration_index(seed, len(eligible))]
+    overflow = [
+        replace(card, selection_mode="exploitation") for card in eligible if card is not chosen
+    ]
+    primary = [
+        *[replace(card, selection_mode="exploitation") for card in exploitation],
+        replace(chosen, selection_mode="exploration"),
+    ]
+    audit = SelectionAudit(
+        eligible_set=tuple(_candidate_id(card) for card in eligible),
+        selection_propensity=1.0 / len(eligible),
+        seed=seed,
+        selection_policy_version=SELECTION_POLICY_VERSION,
+        backfill=False,
+    )
+    return primary, overflow, audit
+
+
+def _allocate_stateful(
+    cards: Sequence[RetrievalCard],
+    *,
+    provisional_slots: int,
+    seed: str,
+) -> tuple[list[RetrievalCard], SelectionAudit]:
+    """Fill 8 verified slots and ``provisional_slots`` provisional slots.
+
+    A short channel is backfilled from the other channel's overflow.
+    Backfilled cards keep the channel and in-channel rank they had before
+    slotting. Fact cards never enter this function. Verified cards stay
+    ``selection_mode="exploitation"``.
+    """
+    verified = [
+        replace(card, selection_mode="exploitation") for card in _assign_ranks(cards, "verified")
+    ]
     provisional = _assign_ranks(cards, "provisional")
     primary_verified = verified[:VERIFIED_SLOTS]
-    primary_provisional = provisional[:PROVISIONAL_SLOTS]
+    primary_provisional, provisional_overflow, audit = _select_provisional(
+        provisional, provisional_slots, seed
+    )
     verified_deficit = VERIFIED_SLOTS - len(primary_verified)
-    provisional_deficit = PROVISIONAL_SLOTS - len(primary_provisional)
-    backfill_verified_slots = provisional[PROVISIONAL_SLOTS : PROVISIONAL_SLOTS + verified_deficit]
+    provisional_deficit = provisional_slots - len(primary_provisional)
+    backfill_verified_slots = provisional_overflow[:verified_deficit]
     backfill_provisional_slots = verified[VERIFIED_SLOTS : VERIFIED_SLOTS + provisional_deficit]
     return [
         *primary_verified,
         *backfill_verified_slots,
         *primary_provisional,
         *backfill_provisional_slots,
-    ]
+    ], audit
 
 
 class HybridRetrievalFacade:
@@ -878,6 +1040,7 @@ class HybridRetrievalFacade:
         rerank: RerankHook | RerankFn | None = None,
         acl_filter: AclFilter | None = None,
         feature_version: str = FEATURE_SPEC_VERSION,
+        seed: str | int | None = None,
     ) -> None:
         self.fork_branch = fork_branch
         self.projection = projection
@@ -885,6 +1048,7 @@ class HybridRetrievalFacade:
         self.rerank = rerank if rerank is not None else IdentityRerank()
         self.acl_filter = acl_filter if acl_filter is not None else default_acl_filter
         self.feature_version = _require_str(feature_version, "feature_version")
+        self.seed = _normalize_seed(seed)
 
     def retrieve(
         self,
@@ -901,6 +1065,7 @@ class HybridRetrievalFacade:
         parsed = coerce_query(query)
         budgets = coerce_profile(profile)
         _principal_set(principal_labels)
+        seed = self.seed if self.seed is not None else _derive_query_seed(parsed)
         fork_cards = self._visible(
             self.fork_branch.search(parsed, budgets.fork_branch, principal_labels),
             principal_labels,
@@ -913,8 +1078,15 @@ class HybridRetrievalFacade:
             self.segment_atom.search(parsed, budgets.segment_atom, principal_labels),
             principal_labels,
         )
-        stateful = _allocate_stateful([*fork_cards, *projection_cards])
-        facts = _assign_ranks(fact_cards, "fact")
+        stateful, audit = _allocate_stateful(
+            [*fork_cards, *projection_cards],
+            provisional_slots=budgets.provisional_slots,
+            seed=seed,
+        )
+        facts = [
+            replace(card, selection_mode="exploitation")
+            for card in _assign_ranks(fact_cards, "fact")
+        ]
         selected = [*stateful, *facts]
         context: dict[str, Any] = {
             "feature_version": self.feature_version,
@@ -928,6 +1100,7 @@ class HybridRetrievalFacade:
             cards=tuple(clamped),
             feature_version=self.feature_version,
             truncated_by_rerank_clamp=truncated,
+            selection_audit=audit,
         )
 
     def expand_claim_neighborhood(
