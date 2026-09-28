@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from openviking.session.causal_bridges import (
+    PATH_EVALUATION_ORDER,
     PATH_MAX_ENTITIES,
     PATH_MAX_HYPOTHESIS_HOPS,
     PER_NODE_ACTIVE_CAP,
@@ -21,6 +22,8 @@ from openviking.session.causal_bridges import (
     HypothesisJudgment,
     QuotaExceeded,
     check_path_budget,
+    evaluate_path,
+    evaluate_paths,
 )
 
 _CAUSAL_CONFIG = {"skill_trajectory_mode": "causal"}
@@ -481,3 +484,245 @@ def test_injected_clock_stamps_persisted_judgment_and_reactivation(tmp_path: Pat
     assert stored.created_at == expected
     assert stored.status == "reactivated"
     assert stored.status_events[-1].at == expected
+
+
+def _always_applicable(query_context: object, endpoint: object) -> tuple[bool, str]:
+    assert isinstance(endpoint, dict)
+    return True, "direct"
+
+
+def test_failing_endpoint_prunes_path_and_records_reason() -> None:
+    seen: list[tuple[object, str]] = []
+
+    def checker(query_context: object, endpoint: dict[str, object]) -> tuple[bool, str]:
+        seen.append((query_context, str(endpoint["role"])))
+        if endpoint["entity"] == "tail":
+            return False, "tail is not about the query"
+        return True, "applies"
+
+    batch = evaluate_paths(
+        [
+            {
+                "entities": ["head", "mid", "tail"],
+                "bridges": [
+                    {"kind": "hypothesis", "bridge_id": "h1"},
+                    {"kind": "evidence", "bridge_id": "ev"},
+                ],
+            },
+            {
+                "entities": ["head", "other"],
+                "bridges": [{"kind": "hypothesis", "bridge_id": "h2"}],
+            },
+        ],
+        query_context={"query": "original"},
+        endpoint_applicability=checker,
+    )
+
+    assert batch.evaluation_order == PATH_EVALUATION_ORDER == (
+        "path_budget",
+        "endpoint_applicability",
+    )
+    assert batch.endpoint_applicability == "checked"
+    assert len(batch.pruned) == 1
+    assert len(batch.retained) == 1
+    assert batch.unchecked == ()
+    pruned = batch.pruned[0]
+    assert pruned.pruned is True
+    assert pruned.accepted is False
+    assert pruned.endpoint_applicability == "fail"
+    assert pruned.budget_violations == ()
+    assert [(item.role, item.ok, item.reason) for item in pruned.endpoint_checks] == [
+        ("start", True, "applies"),
+        ("end", False, "tail is not about the query"),
+    ]
+    assert batch.retained[0].accepted is True
+    assert batch.retained[0].endpoint_applicability == "pass"
+    assert seen[0][0] == {"query": "original"}
+    assert [role for _, role in seen[:2]] == ["start", "end"]
+
+
+def test_omitted_endpoint_checker_marks_unchecked() -> None:
+    assessed = evaluate_path(
+        ["a", "b"],
+        [{"kind": "hypothesis", "bridge_id": "h1"}],
+    )
+    assert assessed.endpoint_applicability == "unchecked"
+    assert assessed.endpoint_checks == ()
+    assert assessed.accepted is False
+    assert assessed.pruned is False
+    assert assessed.budget_violations == ()
+    assert assessed.evaluation_order == PATH_EVALUATION_ORDER
+    assert assessed.to_dict()["endpoint_applicability"] == "unchecked"
+
+    batch = evaluate_paths(
+        [
+            {"entities": ["a", "b"], "bridges": [{"kind": "hypothesis", "bridge_id": "h1"}]},
+            {"entities": [f"n{index}" for index in range(13)], "bridges": []},
+        ],
+        endpoint_applicability=None,
+    )
+    assert batch.endpoint_applicability == "unchecked"
+    assert batch.retained == ()
+    assert len(batch.unchecked) == 1
+    assert batch.unchecked[0].endpoint_applicability == "unchecked"
+    assert batch.unchecked[0].accepted is False
+    assert [item.code for item in batch.pruned[0].budget_violations] == ["entity_count"]
+    assert batch.pruned[0].endpoint_applicability == "unchecked"
+
+
+def test_passing_endpoints_preserve_path_budget() -> None:
+    cases = [
+        (
+            [f"e{index}" for index in range(4)],
+            [
+                {"kind": "hypothesis", "bridge_id": "h1"},
+                {"kind": "hypothesis", "bridge_id": "h2"},
+                {"kind": "evidence", "bridge_id": "e1"},
+                {"kind": "hypothesis", "bridge_id": "h3"},
+            ],
+        ),
+        ([f"n{index}" for index in range(13)], []),
+        (["a", "b", "a"], [{"kind": "hypothesis", "bridge_id": "only"}]),
+        (
+            ["a", "b", "c"],
+            [
+                {"kind": "hypothesis", "bridge_id": "same"},
+                {"kind": "hypothesis", "bridge_id": "same"},
+            ],
+        ),
+        (
+            [f"n{index}" for index in range(PATH_MAX_ENTITIES)],
+            [
+                {"kind": "hypothesis", "bridge_id": "h1"},
+                {"kind": "evidence", "bridge_id": "ev"},
+                {"kind": "hypothesis", "bridge_id": "h2"},
+            ],
+        ),
+    ]
+    for entities, bridges in cases:
+        budget = check_path_budget(entities, bridges)
+        assessed = evaluate_path(
+            entities,
+            bridges,
+            query_context={"query": "original"},
+            endpoint_applicability=_always_applicable,
+        )
+        assert [item.code for item in assessed.budget_violations] == [item.code for item in budget]
+        assert assessed.endpoint_applicability == "pass"
+        assert all(item.ok and item.reason == "direct" for item in assessed.endpoint_checks)
+        assert len(assessed.endpoint_checks) == 2
+        assert assessed.pruned is bool(budget)
+        assert assessed.accepted is (budget == [])
+
+    clean_entities = ["head", "tail"]
+    clean_bridges = [{"kind": "hypothesis", "bridge_id": "h1"}]
+    batch = evaluate_paths(
+        [{"entities": clean_entities, "bridges": clean_bridges}],
+        query_context={"query": "original"},
+        endpoint_applicability=_always_applicable,
+    )
+    assert batch.pruned == ()
+    assert batch.unchecked == ()
+    assert len(batch.retained) == 1
+    assert batch.retained[0].budget_violations == tuple(check_path_budget(clean_entities, clean_bridges))
+    assert list(batch.retained[0].budget_violations) == []
+
+
+def test_budget_stage_runs_before_endpoint_check_and_both_are_kept() -> None:
+    calls = {"count": 0}
+
+    def checker(query_context: object, endpoint: object) -> tuple[bool, str]:
+        calls["count"] += 1
+        return False, "endpoint rejected"
+
+    with pytest.raises(ValueError, match="cannot exceed"):
+        evaluate_path(
+            ["a", "b"],
+            [{"kind": "hypothesis", "bridge_id": "h1"}],
+            endpoint_applicability=checker,
+            max_hypothesis_hops=PATH_MAX_HYPOTHESIS_HOPS + 1,
+        )
+    assert calls["count"] == 0
+
+    assessed = evaluate_path(
+        [f"n{index}" for index in range(13)],
+        [],
+        query_context={"query": "original"},
+        endpoint_applicability=checker,
+    )
+    assert assessed.evaluation_order[0] == "path_budget"
+    assert assessed.evaluation_order[1] == "endpoint_applicability"
+    assert [item.code for item in assessed.budget_violations] == ["entity_count"]
+    assert [item.reason for item in assessed.endpoint_checks if not item.ok] == [
+        "endpoint rejected",
+        "endpoint rejected",
+    ]
+    assert assessed.to_dict()["budget_violations"][0]["code"] == "entity_count"
+    assert calls["count"] == 2
+
+
+def test_traversable_edges_applicability_prunes_with_reason_and_defaults_unchecked(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    visible = _judge(store, index=1, run_id="run-1", relevance=1.0, judgment_id="j-vis")
+    hidden = store.record_judgment(
+        run_id="run-2",
+        source_ref=_SOURCE,
+        target_ref=_target(2),
+        relation_type="explores",
+        relevance=1.0,
+        timestamp="2026-09-24T00:00:02.000Z",
+        judgment_id="j-hidden",
+        direct_relevance=1.0,
+        security_labels=["other"],
+    )
+
+    plain = store.traversable_edges(_SOURCE, _PRINCIPAL)
+    assert plain.endpoint_applicability == "unchecked"
+    assert plain.evaluation_order == PATH_EVALUATION_ORDER
+    assert plain.pruned == ()
+    assert [item.bridge_id for item in plain] == [visible.bridge_id]
+    assert hidden.bridge_id not in {item.bridge_id for item in plain}
+    assert len(plain.assessments) == 1
+    assert plain.assessments[0].endpoint_applicability == "unchecked"
+    assert plain.assessments[0].accepted is False
+    assert plain.to_dict()["endpoint_applicability"] == "unchecked"
+
+    def reject_target(query_context: object, endpoint: dict[str, object]) -> tuple[bool, str]:
+        assert query_context == {"query": "original"}
+        entity = endpoint["entity"]
+        assert isinstance(entity, dict)
+        if entity.get("id") == "mem-1":
+            return False, "target misses the query"
+        if entity.get("id") == "mem-2":
+            raise AssertionError("ACL-hidden endpoint must not be checked")
+        return True, "applies"
+
+    filtered = store.traversable_edges(
+        _SOURCE,
+        _PRINCIPAL,
+        query_context={"query": "original"},
+        endpoint_applicability=reject_target,
+    )
+    assert filtered.endpoint_applicability == "checked"
+    assert list(filtered) == []
+    assert len(filtered.pruned) == 1
+    assert filtered.pruned[0].bridge_id == visible.bridge_id
+    assert filtered.pruned[0].endpoint_applicability == "fail"
+    failed = [item for item in filtered.pruned[0].endpoint_checks if not item.ok]
+    assert len(failed) == 1
+    assert failed[0].reason == "target misses the query"
+    assert failed[0].role == "end"
+    assert hidden.bridge_id not in {item.bridge_id for item in filtered.assessments}
+
+    passed = store.traversable_edges(
+        _SOURCE,
+        _PRINCIPAL,
+        query_context={"query": "original"},
+        endpoint_applicability=_always_applicable,
+    )
+    assert [item.bridge_id for item in passed] == [visible.bridge_id]
+    assert passed.pruned == ()
+    assert passed.assessments[0].accepted is True
+    assert passed.assessments[0].endpoint_applicability == "pass"

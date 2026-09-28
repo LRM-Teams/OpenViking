@@ -6,6 +6,11 @@ Bridges aggregate by canonical directed endpoint pair + relation_type. Every
 model judgment is an append-only audit event. Active outgoing hypothesis edges
 are capped per node; excess edges leave the traversal index without deleting
 judgments. Writes are gated by ``is_causal_mode_enabled``.
+
+Path assessment runs ``check_path_budget`` and then an optional endpoint
+applicability callable, in ``PATH_EVALUATION_ORDER``. Omitting the callable
+marks the path ``unchecked``. ``accepted`` is true only when the budget is
+clean and every endpoint check passed.
 """
 
 from __future__ import annotations
@@ -33,6 +38,10 @@ PER_NODE_ACTIVE_CAP = 32
 PER_RUN_WRITE_QUOTA = 12
 PATH_MAX_HYPOTHESIS_HOPS = 2
 PATH_MAX_ENTITIES = 12
+# Budget is computed first. Endpoint applicability runs second. Both results
+# land on the same PathAssessment / PathEvaluationBatch.
+PATH_EVALUATION_ORDER = ("path_budget", "endpoint_applicability")
+ENDPOINT_APPLICABILITY_UNCHECKED = "unchecked"
 
 BridgeKind = Literal["hypothesis", "evidence"]
 BridgeStatus = Literal["active", "inactive", "reactivated"]
@@ -50,6 +59,8 @@ REACTIVATION_SIGNALS = frozenset(
 )
 
 ScoreFn = Callable[[float, float, float], float]
+EndpointApplicability = Callable[[Any, Mapping[str, Any]], tuple[bool, str]]
+EndpointRole = Literal["start", "end"]
 
 
 class QuotaExceeded(Exception):
@@ -495,6 +506,7 @@ def check_path_budget(
 
     Limits cannot be loosened past ``PATH_MAX_HYPOTHESIS_HOPS`` and
     ``PATH_MAX_ENTITIES``. Duplicate nodes and edges are always violations.
+    Endpoint applicability is the next stage; use ``evaluate_path``.
     """
     hop_limit = _tighten_limit(
         max_hypothesis_hops, PATH_MAX_HYPOTHESIS_HOPS, "max_hypothesis_hops"
@@ -552,6 +564,306 @@ def check_path_budget(
             )
         )
     return violations
+
+
+@dataclass(frozen=True)
+class EndpointCheck:
+    """One path-endpoint applicability result, kept for audit."""
+
+    role: EndpointRole
+    index: int | None
+    entity: Any
+    ok: bool
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        entity = dict(self.entity) if isinstance(self.entity, dict) else self.entity
+        return {
+            "role": self.role,
+            "index": self.index,
+            "entity": entity,
+            "ok": self.ok,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class PathAssessment:
+    """Budget violations and endpoint applicability for one path.
+
+    ``endpoint_applicability`` is ``"unchecked"`` when no checker was injected,
+    ``"pass"`` when every endpoint check succeeded, and ``"fail"`` when any
+    endpoint check failed. ``accepted`` is true only for a clean budget plus
+    ``"pass"``.
+    """
+
+    budget_violations: tuple[PathViolation, ...]
+    endpoint_applicability: str
+    endpoint_checks: tuple[EndpointCheck, ...]
+    evaluation_order: tuple[str, ...] = PATH_EVALUATION_ORDER
+    bridge_id: str | None = None
+
+    @property
+    def pruned(self) -> bool:
+        """True when the budget fails or an endpoint check fails."""
+        return bool(self.budget_violations) or self.endpoint_applicability == "fail"
+
+    @property
+    def accepted(self) -> bool:
+        """True only when the budget is clean and both endpoints passed."""
+        return not self.budget_violations and self.endpoint_applicability == "pass"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "evaluation_order": list(self.evaluation_order),
+            "budget_violations": [item.to_dict() for item in self.budget_violations],
+            "endpoint_applicability": self.endpoint_applicability,
+            "endpoint_checks": [item.to_dict() for item in self.endpoint_checks],
+            "pruned": self.pruned,
+            "accepted": self.accepted,
+            "bridge_id": self.bridge_id,
+        }
+
+
+@dataclass(frozen=True)
+class PathEvaluationBatch:
+    """Paths split after ``PATH_EVALUATION_ORDER``.
+
+    ``pruned`` keeps every budget failure and every failed endpoint check,
+    including ``reason``. ``unchecked`` holds budget-clean paths that had no
+    checker. ``retained`` holds only paths that passed the budget and both
+    endpoint checks.
+    """
+
+    evaluation_order: tuple[str, ...]
+    endpoint_applicability: str
+    retained: tuple[PathAssessment, ...]
+    pruned: tuple[PathAssessment, ...]
+    unchecked: tuple[PathAssessment, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "evaluation_order": list(self.evaluation_order),
+            "endpoint_applicability": self.endpoint_applicability,
+            "retained": [item.to_dict() for item in self.retained],
+            "pruned": [item.to_dict() for item in self.pruned],
+            "unchecked": [item.to_dict() for item in self.unchecked],
+        }
+
+
+class TraversableEdges(list[BridgeRecord]):
+    """ACL-visible edges plus the path assessment of each candidate edge.
+
+    Iteration yields the edges that remain traversable. ``endpoint_applicability``
+    is ``"unchecked"`` when no checker was injected, and those edges stay in the
+    list. ``"checked"`` means a checker ran: edges that fail the budget or an
+    endpoint check are omitted here and preserved on ``pruned`` with reasons.
+    ``assessments`` lists every candidate, including pruned ones.
+    """
+
+    def __init__(
+        self,
+        edges: Sequence[BridgeRecord],
+        assessments: Sequence[PathAssessment],
+        *,
+        applicability: str,
+        pruned: Sequence[PathAssessment],
+    ) -> None:
+        super().__init__(edges)
+        self.assessments = tuple(assessments)
+        self.endpoint_applicability = applicability
+        self.evaluation_order = PATH_EVALUATION_ORDER
+        self.pruned = tuple(pruned)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "evaluation_order": list(self.evaluation_order),
+            "endpoint_applicability": self.endpoint_applicability,
+            "edges": [edge.bridge_id for edge in self],
+            "assessments": [item.to_dict() for item in self.assessments],
+            "pruned": [item.to_dict() for item in self.pruned],
+        }
+
+
+def _endpoint_entity_payload(entity: Any) -> Any:
+    if isinstance(entity, NodeRef):
+        return entity.to_dict()
+    if isinstance(entity, str):
+        return entity
+    if isinstance(entity, Mapping):
+        return dict(entity)
+    raise ValueError("entity must be a NodeRef, str, or dict")
+
+
+def _path_endpoint_slots(
+    entity_sequence: Sequence[Any],
+) -> list[tuple[EndpointRole, int, Any]]:
+    if len(entity_sequence) == 0:
+        return []
+    last = len(entity_sequence) - 1
+    return [
+        ("start", 0, entity_sequence[0]),
+        ("end", last, entity_sequence[last]),
+    ]
+
+
+def _missing_endpoint_checks() -> tuple[EndpointCheck, EndpointCheck]:
+    reason = "missing path endpoint"
+    return (
+        EndpointCheck(role="start", index=None, entity=None, ok=False, reason=reason),
+        EndpointCheck(role="end", index=None, entity=None, ok=False, reason=reason),
+    )
+
+
+def _coerce_applicability_result(result: Any) -> tuple[bool, str]:
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise ValueError("endpoint_applicability must return (ok, reason)")
+    ok, reason = result
+    if not isinstance(ok, bool):
+        raise ValueError("endpoint_applicability ok must be a bool")
+    if not isinstance(reason, str):
+        raise ValueError("endpoint_applicability reason must be a str")
+    return ok, reason
+
+
+def _check_one_endpoint(
+    checker: EndpointApplicability,
+    query_context: Any,
+    role: EndpointRole,
+    index: int,
+    entity: Any,
+) -> EndpointCheck:
+    payload = _endpoint_entity_payload(entity)
+    descriptor = {"role": role, "index": index, "entity": payload}
+    ok, reason = _coerce_applicability_result(checker(query_context, descriptor))
+    return EndpointCheck(role=role, index=index, entity=payload, ok=ok, reason=reason)
+
+
+def _require_applicability(
+    endpoint_applicability: EndpointApplicability | None,
+) -> None:
+    if endpoint_applicability is not None and not callable(endpoint_applicability):
+        raise ValueError("endpoint_applicability must be callable")
+
+
+def evaluate_path(
+    entity_sequence: Sequence[Any],
+    bridge_usage: Sequence[Any],
+    *,
+    query_context: Any = None,
+    endpoint_applicability: EndpointApplicability | None = None,
+    max_hypothesis_hops: int = PATH_MAX_HYPOTHESIS_HOPS,
+    max_entities: int = PATH_MAX_ENTITIES,
+    bridge_id: str | None = None,
+) -> PathAssessment:
+    """Assess one path: budget first, then both endpoints.
+
+    Order is ``PATH_EVALUATION_ORDER``. The assessment always carries both
+    stages. With no checker, ``endpoint_applicability`` is ``"unchecked"`` and
+    the path is not accepted. With a checker, both endpoints are checked after
+    the budget, including when the budget already failed. A failing endpoint
+    prunes the path and the assessment keeps that endpoint's ``reason``.
+    """
+    _require_applicability(endpoint_applicability)
+    if bridge_id is not None:
+        bridge_id = _require_str(bridge_id, "bridge_id")
+
+    violations = check_path_budget(
+        entity_sequence,
+        bridge_usage,
+        max_hypothesis_hops=max_hypothesis_hops,
+        max_entities=max_entities,
+    )
+    if endpoint_applicability is None:
+        return PathAssessment(
+            budget_violations=tuple(violations),
+            endpoint_applicability=ENDPOINT_APPLICABILITY_UNCHECKED,
+            endpoint_checks=(),
+            bridge_id=bridge_id,
+        )
+
+    slots = _path_endpoint_slots(entity_sequence)
+    checks = (
+        _missing_endpoint_checks()
+        if not slots
+        else tuple(
+            _check_one_endpoint(endpoint_applicability, query_context, role, index, entity)
+            for role, index, entity in slots
+        )
+    )
+    status = "pass" if checks and all(item.ok for item in checks) else "fail"
+    return PathAssessment(
+        budget_violations=tuple(violations),
+        endpoint_applicability=status,
+        endpoint_checks=checks,
+        bridge_id=bridge_id,
+    )
+
+
+def _coerce_path_spec(item: Any, index: int) -> tuple[Sequence[Any], Sequence[Any]]:
+    payload = _require_mapping(item, f"paths[{index}]")
+    entities = payload.get("entities", payload.get("entity_sequence"))
+    bridges = payload.get("bridges", payload.get("bridge_usage"))
+    if not isinstance(entities, Sequence) or isinstance(entities, (str, bytes)):
+        raise ValueError(f"paths[{index}].entities must be a sequence")
+    if not isinstance(bridges, Sequence) or isinstance(bridges, (str, bytes)):
+        raise ValueError(f"paths[{index}].bridges must be a sequence")
+    return entities, bridges
+
+
+def evaluate_paths(
+    paths: Sequence[Any],
+    *,
+    query_context: Any = None,
+    endpoint_applicability: EndpointApplicability | None = None,
+    max_hypothesis_hops: int = PATH_MAX_HYPOTHESIS_HOPS,
+    max_entities: int = PATH_MAX_ENTITIES,
+) -> PathEvaluationBatch:
+    """Assess each path with ``evaluate_path`` and keep every outcome.
+
+    Failed budgets and failed endpoints are returned in ``pruned`` with their
+    reasons. Budget-clean paths without a checker are returned in ``unchecked``.
+    """
+    if not isinstance(paths, Sequence) or isinstance(paths, (str, bytes)):
+        raise ValueError("paths must be a sequence")
+    _require_applicability(endpoint_applicability)
+
+    retained: list[PathAssessment] = []
+    pruned: list[PathAssessment] = []
+    unchecked: list[PathAssessment] = []
+    for index, raw in enumerate(paths):
+        entities, bridges = _coerce_path_spec(raw, index)
+        assessment = evaluate_path(
+            entities,
+            bridges,
+            query_context=query_context,
+            endpoint_applicability=endpoint_applicability,
+            max_hypothesis_hops=max_hypothesis_hops,
+            max_entities=max_entities,
+        )
+        unchecked_path = (
+            assessment.endpoint_applicability == ENDPOINT_APPLICABILITY_UNCHECKED
+        )
+        if assessment.pruned and not unchecked_path:
+            pruned.append(assessment)
+        elif unchecked_path:
+            if assessment.budget_violations:
+                pruned.append(assessment)
+            else:
+                unchecked.append(assessment)
+        else:
+            retained.append(assessment)
+    return PathEvaluationBatch(
+        evaluation_order=PATH_EVALUATION_ORDER,
+        endpoint_applicability=(
+            ENDPOINT_APPLICABILITY_UNCHECKED
+            if endpoint_applicability is None
+            else "checked"
+        ),
+        retained=tuple(retained),
+        pruned=tuple(pruned),
+        unchecked=tuple(unchecked),
+    )
 
 
 def _security_labels_from(value: Any) -> tuple[str, ...]:
@@ -1068,12 +1380,23 @@ class CausalBridgeStore:
         self,
         node_ref: NodeRef | Mapping[str, Any],
         principal_labels: Sequence[str],
-    ) -> list[BridgeRecord]:
+        *,
+        query_context: Any = None,
+        endpoint_applicability: EndpointApplicability | None = None,
+    ) -> TraversableEdges:
         """Active and reactivated edges incident to ``node_ref`` and visible to ``principal_labels``.
 
         Bridges with no security labels are invisible to every principal.
         Inactive edges are omitted. Governance still ranks the full set.
+        ``principal_labels`` stays an ACL filter.
+
+        Each visible edge is then assessed as a two-endpoint path. Budget runs
+        before endpoint applicability (``PATH_EVALUATION_ORDER``). With no
+        checker the edge list is unchanged and each assessment is ``unchecked``.
+        With a checker, a failed budget or a failed endpoint removes that edge
+        from the list and keeps the assessment, including ``reason``, on ``pruned``.
         """
+        _require_applicability(endpoint_applicability)
         node = validate_node_ref(node_ref, "node_ref")
         principal = _principal_labels(principal_labels)
         edges = [
@@ -1084,7 +1407,32 @@ class CausalBridgeStore:
             and (bridge.source_ref == node or bridge.target_ref == node)
         ]
         edges.sort(key=lambda bridge: (bridge.created_at, bridge.bridge_id))
-        return edges
+        assessments: list[PathAssessment] = []
+        kept: list[BridgeRecord] = []
+        pruned: list[PathAssessment] = []
+        for bridge in edges:
+            assessment = evaluate_path(
+                [bridge.source_ref, bridge.target_ref],
+                [bridge],
+                query_context=query_context,
+                endpoint_applicability=endpoint_applicability,
+                bridge_id=bridge.bridge_id,
+            )
+            assessments.append(assessment)
+            if endpoint_applicability is not None and assessment.pruned:
+                pruned.append(assessment)
+            else:
+                kept.append(bridge)
+        return TraversableEdges(
+            kept,
+            assessments,
+            applicability=(
+                ENDPOINT_APPLICABILITY_UNCHECKED
+                if endpoint_applicability is None
+                else "checked"
+            ),
+            pruned=pruned,
+        )
 
     def get_bridge(self, bridge_id: str) -> BridgeRecord | None:
         return self._bridges.get(bridge_id)
