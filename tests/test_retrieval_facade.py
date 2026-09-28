@@ -987,3 +987,120 @@ def test_exploration_eligible_set_excludes_acl_hidden(tmp_path: Path) -> None:
     assert eligible_ids == set(visible_ids[3:])
     assert eligible_ids.isdisjoint(hidden_ids)
     assert all(set(card.acl_labels) & set(_PRINCIPAL) for card in result.cards)
+
+
+def test_text_match_is_case_insensitive(tmp_path: Path) -> None:
+    root = tmp_path / "casefold"
+    store = _store(root)
+    registry = ProjectionRegistry(root / "projections.json")
+    session_dir = root / "sess-case"
+    ledger = AOLedger(session_dir, "sess-case")
+    upper = ledger.append(
+        {"tool": "read_file", "record_kind": "atom", "acl_labels": ["team-a"]},
+        {"kind": "text", "summary": "CAROLINE met yesterday"},
+    )
+    lower = ledger.append(
+        {"tool": "read_file", "record_kind": "atom", "acl_labels": ["team-a"]},
+        {"kind": "text", "summary": "caroline wrote the note"},
+    )
+    facade = _facade(root, store, registry, session_dir, "sess-case")
+    profile = RetrievalProfile(fork_branch=0, projection=0, segment_atom=2)
+    expected = {upper.ao_id, lower.ao_id}
+
+    lower_query = facade.retrieve("caroline", _PRINCIPAL, profile)
+    assert {card.source_pointer["ao_id"] for card in lower_query.cards} == expected
+    upper_query = facade.retrieve("CAROLINE", _PRINCIPAL, profile)
+    assert {card.source_pointer["ao_id"] for card in upper_query.cards} == expected
+    empty = facade.retrieve("", _PRINCIPAL, profile)
+    assert {card.source_pointer["ao_id"] for card in empty.cards} == expected
+    assert facade.retrieve("melanie", _PRINCIPAL, profile).cards == ()
+
+
+def test_content_resolver_matches_block_body_without_changing_facts(tmp_path: Path) -> None:
+    root = tmp_path / "resolver"
+    store = _store(root)
+    block = _block("b-body", 1)
+    revision = _freeze([block], [], revision_id="rev-body")
+    registry = ProjectionRegistry(root / "projections.json")
+    registry.register(revision, acl_labels=_PRINCIPAL)
+    session_dir = root / "sess-res"
+    ledger = AOLedger(session_dir, "sess-res")
+    fact = ledger.append(
+        {"tool": "read_file", "record_kind": "atom", "acl_labels": ["team-a"]},
+        {"kind": "text", "summary": "notebook stays on the fact channel"},
+    )
+    body = "Caroline met Melanie at the cafe"
+    ao_id = block.source_refs[0].ao_id
+
+    def resolve(key: str) -> str:
+        if key == ao_id:
+            return body
+        return ""
+
+    profile = RetrievalProfile(fork_branch=0, projection=4, segment_atom=2)
+    plain = _facade(root, store, registry, session_dir, "sess-res", views=[revision])
+    assert plain.retrieve("caroline", _PRINCIPAL, profile).cards == ()
+    plain_facts = plain.retrieve("notebook", _PRINCIPAL, profile)
+    assert [card.kind for card in plain_facts.cards] == ["atom"]
+    assert plain_facts.cards[0].source_pointer["ao_id"] == fact.ao_id
+
+    projection = InfluenceProjectionAdapter(registry, views=[revision], content_resolver=resolve)
+    by_body = projection.search("caroline", 4, _PRINCIPAL)
+    by_summary = projection.search("summary-b-body", 4, _PRINCIPAL)
+    assert len(by_body) == 1
+    assert by_body[0].kind == "block_projection"
+    assert by_body[0].to_dict() == by_summary[0].to_dict()
+    assert "cafe" not in json.dumps(by_body[0].to_dict(), ensure_ascii=False)
+
+    facade = HybridRetrievalFacade(
+        ForkBranchAdapter(root, store),
+        projection,
+        SegmentAtomAdapter(session_dir, "sess-res"),
+    )
+    found = facade.retrieve("caroline", _PRINCIPAL, profile)
+    assert [card.kind for card in found.cards] == ["block_projection"]
+    assert all(card.channel != "fact" for card in found.cards)
+    resolved_facts = facade.retrieve("notebook", _PRINCIPAL, profile)
+    assert [card.to_dict() for card in resolved_facts.cards] == [
+        card.to_dict() for card in plain_facts.cards
+    ]
+
+    empty_resolver = InfluenceProjectionAdapter(
+        registry, views=[revision], content_resolver=lambda _ao_id: ""
+    )
+    assert empty_resolver.search("caroline", 4, _PRINCIPAL) == []
+    unbound = InfluenceProjectionAdapter(registry, content_resolver=resolve)
+    assert unbound.search("caroline", 4, _PRINCIPAL) == []
+    assert len(unbound.search("summary-b-body", 4, _PRINCIPAL)) == 1
+
+
+def test_content_resolver_matches_claim_via_linked_block_refs(tmp_path: Path) -> None:
+    root = tmp_path / "resolver-claim"
+    source = _block("b-src", 1)
+    target = _block("b-dst", 2)
+    claim = InfluenceClaim(
+        claim_id="c-link",
+        source_block_id="b-src",
+        target_block_id="b-dst",
+        carried_artifact="fallback-span",
+        downstream_effect="observed outcome",
+        relation_type="influence",
+    )
+    revision = _freeze([source, target], [claim], revision_id="rev-claim-body")
+    registry = ProjectionRegistry(root / "projections.json")
+    registry.register(revision, acl_labels=_PRINCIPAL)
+    body = "Caroline sent the patch"
+    source_ao = source.source_refs[0].ao_id
+
+    def resolve(key: str) -> str:
+        if key == source_ao:
+            return body
+        return ""
+
+    adapter = InfluenceProjectionAdapter(registry, views=[revision], content_resolver=resolve)
+    claims = [card for card in adapter.search("caroline", 10, _PRINCIPAL) if card.kind == "claim_projection"]
+    assert len(claims) == 1
+    assert claims[0].source_pointer["block_or_claim_id"] == "c-link"
+    assert "patch" not in json.dumps(claims[0].to_dict(), ensure_ascii=False)
+    bare = InfluenceProjectionAdapter(registry, views=[revision])
+    assert bare.search("caroline", 10, _PRINCIPAL) == []

@@ -414,10 +414,14 @@ def default_acl_filter(card: RetrievalCard, principal_labels: Sequence[str]) -> 
 
 
 def _text_hits(query: RetrievalQuery, *parts: str) -> bool:
+    """Case-insensitive substring match (``str.casefold`` on both sides).
+
+    An empty query text matches every haystack.
+    """
     if not query.text:
         return True
-    haystack = "\n".join(parts)
-    return query.text in haystack
+    haystack = "\n".join(parts).casefold()
+    return query.text.casefold() in haystack
 
 
 def _score(query: RetrievalQuery) -> dict[str, Any]:
@@ -614,6 +618,39 @@ def _pattern_matches(fields: Mapping[str, str], pattern: Mapping[str, str]) -> b
     return True
 
 
+def _remember_ao_id(ao_id: str, ordered: list[str], seen: set[str]) -> None:
+    if ao_id and ao_id not in seen:
+        seen.add(ao_id)
+        ordered.append(ao_id)
+
+
+def _projection_source_ao_ids(
+    view: InfluenceViewRevision, kind: str, entity_id: str
+) -> list[str]:
+    """AO ids behind one block or claim. Used only to resolve match text."""
+    if kind == "block":
+        for block in view.blocks:
+            if block.block_id == entity_id:
+                return [ref.ao_id for ref in block.source_refs if ref.ao_id]
+        return []
+    if kind != "claim":
+        return []
+    for claim in view.claims:
+        if claim.claim_id != entity_id:
+            continue
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for ref in (*claim.source_evidence_refs, *claim.target_evidence_refs):
+            _remember_ao_id(ref.ao_id, ordered, seen)
+        linked = {claim.source_block_id, claim.target_block_id}
+        for block in view.blocks:
+            if block.block_id in linked:
+                for ref in block.source_refs:
+                    _remember_ao_id(ref.ao_id, ordered, seen)
+        return ordered
+    return []
+
+
 class InfluenceProjectionAdapter:
     """Wraps ``ProjectionRegistry``. Card status maps onto the retrieval channel.
 
@@ -624,6 +661,12 @@ class InfluenceProjectionAdapter:
     ``to_dict``. ``materialize_strength(None)``, ``events()``, and
     ``list_bridges`` are offline management paths; online code must not call
     them.
+
+    ``content_resolver`` maps an AO id to that AO's body text. Resolved text
+    is concatenated into the hit test only. It is not written onto the
+    returned card or its source pointer. A missing resolver, an unbound view,
+    or an empty resolution leaves matching on the summary, card id, and
+    semantic type.
     """
 
     name = "projection"
@@ -632,9 +675,11 @@ class InfluenceProjectionAdapter:
         self,
         registry: ProjectionRegistry,
         views: Sequence[InfluenceViewRevision] | None = None,
+        content_resolver: Callable[[str], str] | None = None,
     ) -> None:
         self._registry = registry
         self._views: dict[str, InfluenceViewRevision] = {}
+        self._content_resolver = content_resolver
         for revision in views or ():
             self.bind_view(revision)
 
@@ -665,7 +710,13 @@ class InfluenceProjectionAdapter:
             if card.kind == "claim" and pattern is not None:
                 if fields is None or not _pattern_matches(fields, pattern):
                     continue
-            if not _text_hits(parsed, card.summary, card.card_id, card.semantic_type):
+            if not _text_hits(
+                parsed,
+                card.summary,
+                card.card_id,
+                card.semantic_type,
+                *self._resolved_match_parts(card),
+            ):
                 continue
             kind: CardKind = "claim_projection" if card.kind == "claim" else "block_projection"
             pointer: dict[str, Any] = {
@@ -693,6 +744,23 @@ class InfluenceProjectionAdapter:
             if len(cards) >= cap:
                 break
         return cards[:cap]
+
+    def _resolved_match_parts(self, card: InfluenceProjection) -> tuple[str, ...]:
+        """Body snippets for the hit test. Never copied onto the card."""
+        resolver = self._content_resolver
+        if resolver is None:
+            return ()
+        view = self._views.get(card.source_pointer.view_revision_id)
+        if view is None:
+            return ()
+        parts: list[str] = []
+        for ao_id in _projection_source_ao_ids(
+            view, card.kind, card.source_pointer.block_or_claim_id
+        ):
+            text = resolver(ao_id)
+            if isinstance(text, str) and text:
+                parts.append(text)
+        return tuple(parts)
 
     def expand_claim_neighborhood(
         self,
