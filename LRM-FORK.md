@@ -43,6 +43,17 @@ CoForge pins the digest, never a moving tag:
 export COFORGE_OPENVIKING_PROTOTYPE_IMAGE=ghcr.io/lrm-teams/openviking@sha256:<digest>
 ```
 
+GHCR packages start **private** even in a public repository, and a personal
+access token without `read:packages` cannot change that. Pulling the digest on
+a machine therefore needs one of:
+
+- `echo "$GHCR_PAT" | docker login ghcr.io -u <user> --password-stdin`, then
+  pull with a token that has `read:packages`; or
+- an org owner sets the package to public in the organization's package
+  settings (Package settings → Change visibility) so an anonymous
+  `docker pull` works. The CI smoke job authenticates with `GITHUB_TOKEN`, so it
+  does not depend on this choice.
+
 `infra/docker/openviking-prototype-local-embed.Dockerfile` in CoForge adds the
 `llama-cpp-python` layer; point its `FROM` at a digest from this repository to
 make the documented prototype image reproducible instead of hand-built.

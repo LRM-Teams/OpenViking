@@ -187,6 +187,15 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Log in to the container registry
+        # GHCR packages default to private, so the smoke pull needs the same
+        # token the build pushed with.
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Pull the pushed digest
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
