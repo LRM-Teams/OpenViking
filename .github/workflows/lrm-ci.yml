@@ -93,6 +93,13 @@ jobs:
 
       # Every test file this fork added on top of upstream. Add new fork test
       # files here as they land (LRM-FORK.md records the same list).
+      #
+      # One pytest process per file on purpose: five of these tests assert on
+      # caplog records, and running every file in a single process makes an
+      # earlier file's logging configuration suppress those records (the state
+      # assertions in the same tests still pass). Until the fork's tests are
+      # order-independent, a per-file run keeps a failure meaning a real
+      # regression instead of test-order noise. See LRM-FORK.md.
       - name: Run fork causal-memory tests
         run: |
           set -euo pipefail
@@ -125,4 +132,18 @@ jobs:
               echo "::notice::fork test file not in this revision, skipped: ${test_file}"
             fi
           done
-          uv run pytest -q -o addopts='' "${present[@]}"
+
+          failed=()
+          for test_file in "${present[@]}"; do
+            echo "::group::${test_file}"
+            if uv run pytest -q -o addopts='' "${test_file}"; then
+              echo "ok: ${test_file}"
+            else
+              failed+=("${test_file}")
+            fi
+            echo "::endgroup::"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::fork test files failed: ${failed[*]}"
+            exit 1
+          fi

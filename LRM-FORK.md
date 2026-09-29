@@ -31,6 +31,18 @@ repository cannot run upstream's `pr.yml` (see below), and a `workflow_call` to
 `_test_lite.yml`, copy the change into `lrm-ci.yml`.** The same workflow lists
 every fork test file explicitly — add new fork test files there.
 
+Known issue: the first CI run of the fork tests showed five failures, all in
+`caplog` assertions (`test_causal_bridges.py::test_corrupt_jsonl_line_is_skipped_and_store_stays_usable`,
+`test_citation_ledger.py::test_offline_counts_warn_once`,
+`test_influence_projection.py::test_acl_change_without_revalidation_callback_warns_once`,
+`test_trajectory_index.py::test_missing_projection_registry_warns_once_and_still_indexes`,
+`test_trajectory_index.py::test_supersede_without_revalidation_callback_warns_once`).
+Their state assertions pass; only the expected log records are missing, because
+an earlier test file in the same pytest process leaves a logging configuration
+behind. `lrm-ci.yml` therefore runs **one pytest process per file**, which is
+how these tests pass. Making the fork's tests order-independent would let CI run
+them in a single process again — worth doing, not done here.
+
 ## CD
 
 | Workflow | Trigger | What it does |
