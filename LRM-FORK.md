@@ -31,17 +31,27 @@ repository cannot run upstream's `pr.yml` (see below), and a `workflow_call` to
 `_test_lite.yml`, copy the change into `lrm-ci.yml`.** The same workflow lists
 every fork test file explicitly — add new fork test files there.
 
-Known issue: the first CI run of the fork tests showed five failures, all in
-`caplog` assertions (`test_causal_bridges.py::test_corrupt_jsonl_line_is_skipped_and_store_stays_usable`,
-`test_citation_ledger.py::test_offline_counts_warn_once`,
-`test_influence_projection.py::test_acl_change_without_revalidation_callback_warns_once`,
-`test_trajectory_index.py::test_missing_projection_registry_warns_once_and_still_indexes`,
-`test_trajectory_index.py::test_supersede_without_revalidation_callback_warns_once`).
-Their state assertions pass; only the expected log records are missing, because
-an earlier test file in the same pytest process leaves a logging configuration
-behind. `lrm-ci.yml` therefore runs **one pytest process per file**, which is
-how these tests pass. Making the fork's tests order-independent would let CI run
-them in a single process again — worth doing, not done here.
+Known issue, handled in CI: five fork tests assert on pytest's `caplog` and
+cannot see any records in a clean checkout.
+`openviking_cli/utils/logger.py::reconfigure_logging` attaches the shared
+handler to the `openviking` logger and sets `propagate = root_name !=
+logger_name`, so `openviking` stops propagating and `openviking.*` records never
+reach the stdlib root logger where `caplog`'s handler lives. The five tests'
+state assertions pass and the expected messages are emitted — only
+observability is lost:
+
+- `tests/test_causal_bridges.py::test_corrupt_jsonl_line_is_skipped_and_store_stays_usable`
+- `tests/test_citation_ledger.py::test_offline_counts_warn_once`
+- `tests/test_influence_projection.py::test_acl_change_without_revalidation_callback_warns_once`
+- `tests/test_trajectory_index.py::test_missing_projection_registry_warns_once_and_still_indexes`
+- `tests/test_trajectory_index.py::test_supersede_without_revalidation_callback_warns_once`
+
+`lrm-ci.yml` loads `.github/ci/propagating_logs_plugin.py`, which forces
+`propagate=True` whenever the fork configures a logger, so the records reach
+`caplog` and the tests keep running instead of being deselected. That plugin is
+CI-only glue and changes no repository code. The better fix is in the fork:
+either have the tests attach their own handler, or keep propagation on in
+`reconfigure_logging`. Remove the plugin when that lands.
 
 ## CD
 
