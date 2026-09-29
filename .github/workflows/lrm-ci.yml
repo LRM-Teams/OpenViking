@@ -1,0 +1,128 @@
+# LRM fork CI — the validation gate for this fork.
+#
+# Upstream's own PR gate (`pr.yml` -> `_build.yml` + `_test_lite.yml`) is disabled
+# in this repository: its default build matrix wants macOS, Windows, and
+# ubuntu-24.04-arm runners, and the release/docs/API workflows around it need
+# upstream secrets that do not exist here. See LRM-FORK.md.
+#
+# The steps below mirror upstream `.github/workflows/_test_lite.yml` one for one
+# (same checkout, uv sync, `cargo check -p ragfs-python`, in-place native build,
+# then the cuVS CPU regression tests), and then run the test files this fork
+# added. Re-sync the mirrored steps whenever _test_lite.yml changes upstream.
+name: LRM Fork CI
+
+on:
+  push:
+    branches: [main, 'feat/**']
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - 'LICENSE'
+      - '**.png'
+      - '**.jpg'
+      - '**.jpeg'
+      - '**.gif'
+      - '**.svg'
+      - '.gitignore'
+      - '.editorconfig'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lrm-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fork-gate:
+    name: Fork gate (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # The shipped prototype image runs Python 3.13 (Dockerfile runtime
+        # stage). pyproject declares requires-python >=3.10; add "3.10" here if
+        # a change needs the declared floor checked as well.
+        os: ["ubuntu-24.04"]
+        python-version: ["3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      - name: Install Python dependencies
+        run: uv sync --frozen --extra test
+
+      - name: Install build dependencies
+        run: uv pip install setuptools setuptools_scm cmake wheel
+
+      - name: Check ragfs-python workspace build
+        run: cargo check -p ragfs-python
+
+      - name: Build C++ extensions
+        run: uv run python setup.py build_ext --inplace
+
+      - name: Run cuVS CPU-only regression tests (upstream lite suite)
+        run: |
+          uv run pytest -q -o addopts='' \
+            tests/vectordb/test_cuvs_config.py \
+            tests/vectordb/test_cuvs_index.py \
+            tests/vectordb/test_cuvs_collection.py \
+            tests/vectordb/test_str_to_uint64.py
+
+      # Every test file this fork added on top of upstream. Add new fork test
+      # files here as they land (LRM-FORK.md records the same list).
+      - name: Run fork causal-memory tests
+        run: |
+          set -euo pipefail
+          fork_tests=(
+            tests/test_ao_ledger.py
+            tests/test_ao_ledger_reader.py
+            tests/test_ao_ledger_recorder.py
+            tests/test_causal_bridges.py
+            tests/test_causal_clusters.py
+            tests/test_causal_experiences.py
+            tests/test_citation_ledger.py
+            tests/test_evaluation_loop.py
+            tests/test_evaluation_orchestrator.py
+            tests/test_fork_revision_lifecycle.py
+            tests/test_handoff_envelope.py
+            tests/test_influence_projection.py
+            tests/test_influence_view.py
+            tests/test_memory_hints.py
+            tests/test_outcome_utility.py
+            tests/test_retrieval_facade.py
+            tests/test_skill_invocation_capture.py
+            tests/test_skill_trajectory_mode.py
+            tests/test_trajectory_index.py
+          )
+          present=()
+          for test_file in "${fork_tests[@]}"; do
+            if [ -f "${test_file}" ]; then
+              present+=("${test_file}")
+            else
+              echo "::notice::fork test file not in this revision, skipped: ${test_file}"
+            fi
+          done
+          uv run pytest -q -o addopts='' "${present[@]}"
